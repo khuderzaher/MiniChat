@@ -1,16 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-reasoning/parser.py
-
-محلل بسيط للجمل المنطقية العربية.
-
-المرحلة الأولى:
-- استخراج الحقائق الصريحة من النمط:
-    X هو Y
-    X هي Y
-
-لا يقوم هذا الملف بالاستدلال.
-"""
+"""Arabic logical fact parser."""
 
 from __future__ import annotations
 
@@ -19,6 +8,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from arabic_utils import normalize_arabic
+from reasoning.model import Fact
 
 
 @dataclass(frozen=True)
@@ -26,17 +16,33 @@ class ParsedFact:
     subject: str
     predicate: str
     source_text: str
+    negated: bool = False
 
     @property
     def fact(self) -> str:
-        return f"{self.subject} هو {self.predicate}"
+        prefix = "¬" if self.negated else ""
+        return f"{prefix}{self.subject} هو {self.predicate}"
+
+    def to_fact(self) -> Fact:
+        return Fact(
+            subject=self.subject,
+            predicate=self.predicate,
+            negated=self.negated,
+            source_text=self.source_text,
+        )
 
 
 class ArabicLogicParser:
-    """محلل حقائق عربية صريحة."""
+    """Parse explicit Arabic facts into typed semantic facts."""
 
     FACT_PATTERN = re.compile(
         r"^\s*(.+?)\s+(?:هو|هي)\s+(.+?)\s*[.،؟?]?\s*$"
+    )
+
+    NEGATION_PREFIXES = (
+        "ليس ",
+        "ليست ",
+        "غير ",
     )
 
     def parse_fact(self, text: str) -> Optional[ParsedFact]:
@@ -44,12 +50,10 @@ class ArabicLogicParser:
             return None
 
         original = text.strip()
-
         if not original:
             return None
 
         normalized = normalize_arabic(original).strip()
-
         match = self.FACT_PATTERN.match(normalized)
 
         if not match:
@@ -61,14 +65,32 @@ class ArabicLogicParser:
         if not subject or not predicate:
             return None
 
+        negated = False
+        for prefix in self.NEGATION_PREFIXES:
+            if predicate.startswith(prefix):
+                predicate = self._clean(predicate[len(prefix):])
+                negated = True
+                break
+
+        if not predicate:
+            return None
+
         return ParsedFact(
             subject=subject,
             predicate=predicate,
             source_text=original,
+            negated=negated,
         )
+
+    def parse_typed(self, text: str) -> Optional[Fact]:
+        parsed = self.parse_fact(text)
+        return parsed.to_fact() if parsed else None
 
     @staticmethod
     def _clean(value: str) -> str:
         value = re.sub(r"\s+", " ", value)
         return value.strip(" ،.؟?")
 
+
+def parse_fact(text: str) -> Optional[Fact]:
+    return ArabicLogicParser().parse_typed(text)

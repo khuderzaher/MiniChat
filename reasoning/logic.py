@@ -1,13 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-MiniChat v3 — Deterministic Logic Engine
-
-- Modus Ponens
-- bounded closure
-- contradiction detection
-- proof provenance
-- proof-specific premises
-"""
+"""Deterministic typed logic engine with legacy compatibility."""
 
 from __future__ import annotations
 
@@ -15,6 +7,7 @@ from dataclasses import dataclass
 from typing import Iterable, Optional
 
 from core.types import ReasoningResult
+from reasoning.model import Fact, SemanticRule, clean_text
 
 
 @dataclass(frozen=True)
@@ -24,58 +17,81 @@ class Rule:
     source: Optional[str] = None
 
 
+def _parse_fact(value: str | Fact) -> Fact:
+    if isinstance(value, Fact):
+        return value
+
+    text = clean_text(value)
+    if not text:
+        return Fact("")
+
+    negated = text.startswith("¬")
+    body = text[1:].strip() if negated else text
+
+    # Preserve arbitrary legacy atomic facts such as A, B, C.
+    for marker in (" هو ", " هي "):
+        if marker in body:
+            subject, predicate = body.split(marker, 1)
+            return Fact(
+                subject=subject,
+                predicate=predicate,
+                negated=negated,
+                source_text=text,
+            )
+
+    return Fact(
+        subject=body,
+        predicate="",
+        negated=negated,
+        source_text=text,
+    )
+
+
 class LogicReasoner:
     def __init__(self, max_depth: int = 10):
         if max_depth < 1:
             raise ValueError("max_depth يجب أن يكون >= 1")
 
         self.max_depth = max_depth
-        self.facts: set[str] = set()
-        self.rules: list[Rule] = []
+        self.facts: set[Fact] = set()
+        self.rules: list[SemanticRule] = []
 
-    def add_fact(self, fact: str) -> None:
-        fact = self._clean(fact)
-        if fact:
-            self.facts.add(fact)
+    def add_fact(self, fact: str | Fact) -> None:
+        parsed = _parse_fact(fact)
+        if parsed.subject:
+            self.facts.add(parsed)
 
-    def add_facts(self, facts: Iterable[str]) -> None:
+    def add_facts(self, facts: Iterable[str | Fact]) -> None:
         for fact in facts:
             self.add_fact(fact)
 
     def add_rule(
         self,
-        premise: str,
-        conclusion: str,
+        premise: str | Fact,
+        conclusion: str | Fact,
         source: Optional[str] = None,
     ) -> None:
-        premise = self._clean(premise)
-        conclusion = self._clean(conclusion)
+        p = _parse_fact(premise)
+        c = _parse_fact(conclusion)
 
-        if not premise or not conclusion:
+        if not p.subject or not c.subject:
             raise ValueError("المقدمة والنتيجة يجب ألا تكونا فارغتين")
 
-        self.rules.append(Rule(premise, conclusion, source))
+        self.rules.append(SemanticRule(p, c, source))
 
     @staticmethod
     def negate(value: str) -> str:
-        value = " ".join(value.strip().split())
-
-        if value.startswith("¬"):
-            return value[1:].strip()
-
-        return f"¬{value}"
+        return str(_parse_fact(value).negate())
 
     def infer(self, goal: Optional[str] = None) -> ReasoningResult:
         known = set(self.facts)
 
-        # لكل حقيقة: مجموعة الحقائق الأصلية التي تعتمد عليها.
-        provenance: dict[str, set[str]] = {
+        provenance: dict[Fact, set[Fact]] = {
             fact: {fact}
-            for fact in self.facts
+            for fact in known
         }
 
         steps: list[str] = []
-        derived_by: dict[str, Rule] = {}
 
         for _depth in range(1, self.max_depth + 1):
             added = False
@@ -88,12 +104,9 @@ class LogicReasoner:
                     continue
 
                 known.add(rule.conclusion)
-                added = True
-
                 provenance[rule.conclusion] = set(
                     provenance.get(rule.premise, {rule.premise})
                 )
-                derived_by[rule.conclusion] = rule
 
                 source = f" ({rule.source})" if rule.source else ""
 
@@ -102,6 +115,8 @@ class LogicReasoner:
                     f"{rule.premise} → {rule.conclusion}{source}"
                 )
 
+                added = True
+
             if not added:
                 break
 
@@ -109,31 +124,37 @@ class LogicReasoner:
             return ReasoningResult(
                 valid=True,
                 conclusion=None,
-                premises=sorted(self.facts),
+                premises=sorted(str(f) for f in self.facts),
                 steps=steps,
                 confidence=1.0 if steps or self.facts else None,
                 metadata={
                     "engine": "logic",
-                    "method": "modus_ponens",
-                    "derived_facts": sorted(known - self.facts),
+                    "method": "typed_modus_ponens",
+                    "derived_facts": sorted(
+                        str(f) for f in known - self.facts
+                    ),
                     "proof_provenance": {
-                        key: sorted(value)
-                        for key, value in provenance.items()
+                        str(k): sorted(str(v) for v in values)
+                        for k, values in provenance.items()
                     },
                 },
             )
 
-        clean_goal = self._clean(goal)
-        opposite = self.negate(clean_goal)
+        clean_goal = _parse_fact(goal)
+        opposite = clean_goal.negate()
 
         goal_known = clean_goal in known
         opposite_known = opposite in known
 
         if goal_known and opposite_known:
             premises = sorted(
-                provenance.get(clean_goal, set())
-                | provenance.get(opposite, set())
+                str(f)
+                for f in (
+                    provenance.get(clean_goal, set())
+                    | provenance.get(opposite, set())
+                )
             )
+
             return ReasoningResult(
                 valid=False,
                 conclusion=None,
@@ -142,50 +163,64 @@ class LogicReasoner:
                 confidence=0.0,
                 metadata={
                     "engine": "logic",
-                    "method": "modus_ponens",
+                    "method": "typed_modus_ponens",
                     "status": "contradiction",
-                    "goal": clean_goal,
-                    "negation": opposite,
+                    "goal": str(clean_goal),
+                    "negation": str(opposite),
                     "proof_provenance": {
-                        "goal": sorted(provenance.get(clean_goal, set())),
-                        "negation": sorted(provenance.get(opposite, set())),
+                        "goal": sorted(
+                            str(f)
+                            for f in provenance.get(clean_goal, set())
+                        ),
+                        "negation": sorted(
+                            str(f)
+                            for f in provenance.get(opposite, set())
+                        ),
                     },
                 },
             )
 
         if goal_known:
-            premises = sorted(provenance.get(clean_goal, set()))
+            premises = sorted(
+                str(f)
+                for f in provenance.get(clean_goal, set())
+            )
+
             return ReasoningResult(
                 valid=True,
-                conclusion=clean_goal,
+                conclusion=str(clean_goal),
                 premises=premises,
                 steps=steps,
                 confidence=1.0,
                 metadata={
                     "engine": "logic",
-                    "method": "modus_ponens",
+                    "method": "typed_modus_ponens",
                     "status": "proven",
-                    "goal": clean_goal,
-                    "negation": opposite,
-                    "proof_provenance": sorted(premises),
+                    "goal": str(clean_goal),
+                    "negation": str(opposite),
+                    "proof_provenance": premises,
                 },
             )
 
         if opposite_known:
-            premises = sorted(provenance.get(opposite, set()))
+            premises = sorted(
+                str(f)
+                for f in provenance.get(opposite, set())
+            )
+
             return ReasoningResult(
                 valid=False,
-                conclusion=opposite,
+                conclusion=str(opposite),
                 premises=premises,
                 steps=steps,
                 confidence=1.0,
                 metadata={
                     "engine": "logic",
-                    "method": "modus_ponens",
+                    "method": "typed_modus_ponens",
                     "status": "disproven",
-                    "goal": clean_goal,
-                    "negation": opposite,
-                    "proof_provenance": sorted(premises),
+                    "goal": str(clean_goal),
+                    "negation": str(opposite),
+                    "proof_provenance": premises,
                 },
             )
 
@@ -197,17 +232,10 @@ class LogicReasoner:
             confidence=0.0,
             metadata={
                 "engine": "logic",
-                "method": "modus_ponens",
+                "method": "typed_modus_ponens",
                 "status": "undetermined",
-                "goal": clean_goal,
-                "negation": opposite,
+                "goal": str(clean_goal),
+                "negation": str(opposite),
                 "proof_provenance": [],
             },
         )
-
-    @staticmethod
-    def _clean(value: object) -> str:
-        if not isinstance(value, str):
-            return ""
-
-        return " ".join(value.strip().split())
