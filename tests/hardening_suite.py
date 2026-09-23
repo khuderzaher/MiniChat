@@ -400,17 +400,17 @@ pipeline = Pipeline()
 pipeline.register("reasoner", reasoner)
 
 analysis = runtime.orchestrator.understanding.analyze(
-    "هل سقراط حي؟"
+    "هل سقراط هو حي؟"
 )
 
 plan = runtime.orchestrator.planner.plan(
-    "هل سقراط حي؟",
+    "هل سقراط هو حي؟",
     analysis,
 )
 
 try:
     pipeline_result = pipeline.execute(
-        "هل سقراط حي؟",
+        "هل سقراط هو حي؟",
         plan,
         context={
             "facts": ["سقراط هو إنسان"],
@@ -455,7 +455,7 @@ from runtime import MiniChatRuntime
 runtime = MiniChatRuntime()
 
 result = runtime.handle(
-    "هل سقراط حي؟",
+    "هل سقراط هو حي؟",
     context={
         "facts": ["سقراط هو إنسان"],
         "rules": [
