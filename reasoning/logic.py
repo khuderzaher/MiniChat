@@ -1,16 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-reasoning/logic.py
-نواة استدلال منطقي حتمية لـ MiniChat v3.
+MiniChat v3 — Deterministic Logic Engine
 
-المسؤوليات:
-- تخزين الحقائق والقواعد.
-- تطبيق Modus Ponens.
-- تنفيذ استدلال متسلسل محدود العمق.
-- كشف التناقض بين القضية ونفيها.
-- إنتاج ReasoningResult قابل للتتبع.
-
-هذه الطبقة لا تفسر اللغة الطبيعية ولا تستخدم LLM.
+- Modus Ponens
+- bounded closure
+- contradiction detection
+- proof provenance
+- proof-specific premises
 """
 
 from __future__ import annotations
@@ -23,21 +19,12 @@ from core.types import ReasoningResult
 
 @dataclass(frozen=True)
 class Rule:
-    """قاعدة منطقية بالشكل: premise -> conclusion."""
     premise: str
     conclusion: str
     source: Optional[str] = None
 
 
 class LogicReasoner:
-    """
-    محرك استدلال منطقي حتمي.
-
-    مثال:
-        fact: "المطر"
-        rule: "المطر" -> "الأرض رطبة"
-    """
-
     def __init__(self, max_depth: int = 10):
         if max_depth < 1:
             raise ValueError("max_depth يجب أن يكون >= 1")
@@ -45,10 +32,6 @@ class LogicReasoner:
         self.max_depth = max_depth
         self.facts: set[str] = set()
         self.rules: list[Rule] = []
-
-    # ---------------------------------------------------------
-    # Facts
-    # ---------------------------------------------------------
 
     def add_fact(self, fact: str) -> None:
         fact = self._clean(fact)
@@ -58,10 +41,6 @@ class LogicReasoner:
     def add_facts(self, facts: Iterable[str]) -> None:
         for fact in facts:
             self.add_fact(fact)
-
-    # ---------------------------------------------------------
-    # Rules
-    # ---------------------------------------------------------
 
     def add_rule(
         self,
@@ -75,26 +54,10 @@ class LogicReasoner:
         if not premise or not conclusion:
             raise ValueError("المقدمة والنتيجة يجب ألا تكونا فارغتين")
 
-        self.rules.append(
-            Rule(
-                premise=premise,
-                conclusion=conclusion,
-                source=source,
-            )
-        )
-
-    # ---------------------------------------------------------
-    # Negation
-    # ---------------------------------------------------------
+        self.rules.append(Rule(premise, conclusion, source))
 
     @staticmethod
     def negate(value: str) -> str:
-        """
-        يعكس النفي الصريح:
-
-            B  -> ¬B
-            ¬B -> B
-        """
         value = " ".join(value.strip().split())
 
         if value.startswith("¬"):
@@ -102,24 +65,19 @@ class LogicReasoner:
 
         return f"¬{value}"
 
-    # ---------------------------------------------------------
-    # Inference
-    # ---------------------------------------------------------
-
-    def infer(
-        self,
-        goal: Optional[str] = None,
-    ) -> ReasoningResult:
-
+    def infer(self, goal: Optional[str] = None) -> ReasoningResult:
         known = set(self.facts)
-        premises = sorted(self.facts)
+
+        # لكل حقيقة: مجموعة الحقائق الأصلية التي تعتمد عليها.
+        provenance: dict[str, set[str]] = {
+            fact: {fact}
+            for fact in self.facts
+        }
+
         steps: list[str] = []
+        derived_by: dict[str, Rule] = {}
 
-        # -----------------------------------------------------
-        # 1. Build full reachable closure.
-        # -----------------------------------------------------
-
-        for depth in range(1, self.max_depth + 1):
+        for _depth in range(1, self.max_depth + 1):
             added = False
 
             for rule in self.rules:
@@ -132,11 +90,12 @@ class LogicReasoner:
                 known.add(rule.conclusion)
                 added = True
 
-                source = (
-                    f" ({rule.source})"
-                    if rule.source
-                    else ""
+                provenance[rule.conclusion] = set(
+                    provenance.get(rule.premise, {rule.premise})
                 )
+                derived_by[rule.conclusion] = rule
+
+                source = f" ({rule.source})" if rule.source else ""
 
                 steps.append(
                     f"الخطوة {len(steps) + 1}: "
@@ -146,21 +105,21 @@ class LogicReasoner:
             if not added:
                 break
 
-        # -----------------------------------------------------
-        # 2. No goal: return derived closure.
-        # -----------------------------------------------------
-
         if goal is None:
             return ReasoningResult(
                 valid=True,
                 conclusion=None,
-                premises=premises,
+                premises=sorted(self.facts),
                 steps=steps,
-                confidence=1.0 if steps or premises else None,
+                confidence=1.0 if steps or self.facts else None,
                 metadata={
                     "engine": "logic",
                     "method": "modus_ponens",
                     "derived_facts": sorted(known - self.facts),
+                    "proof_provenance": {
+                        key: sorted(value)
+                        for key, value in provenance.items()
+                    },
                 },
             )
 
@@ -170,11 +129,11 @@ class LogicReasoner:
         goal_known = clean_goal in known
         opposite_known = opposite in known
 
-        # -----------------------------------------------------
-        # 3. Contradiction.
-        # -----------------------------------------------------
-
         if goal_known and opposite_known:
+            premises = sorted(
+                provenance.get(clean_goal, set())
+                | provenance.get(opposite, set())
+            )
             return ReasoningResult(
                 valid=False,
                 conclusion=None,
@@ -187,14 +146,15 @@ class LogicReasoner:
                     "status": "contradiction",
                     "goal": clean_goal,
                     "negation": opposite,
+                    "proof_provenance": {
+                        "goal": sorted(provenance.get(clean_goal, set())),
+                        "negation": sorted(provenance.get(opposite, set())),
+                    },
                 },
             )
 
-        # -----------------------------------------------------
-        # 4. Goal proven.
-        # -----------------------------------------------------
-
         if goal_known:
+            premises = sorted(provenance.get(clean_goal, set()))
             return ReasoningResult(
                 valid=True,
                 conclusion=clean_goal,
@@ -207,14 +167,12 @@ class LogicReasoner:
                     "status": "proven",
                     "goal": clean_goal,
                     "negation": opposite,
+                    "proof_provenance": sorted(premises),
                 },
             )
 
-        # -----------------------------------------------------
-        # 5. Goal disproven.
-        # -----------------------------------------------------
-
         if opposite_known:
+            premises = sorted(provenance.get(opposite, set()))
             return ReasoningResult(
                 valid=False,
                 conclusion=opposite,
@@ -227,17 +185,14 @@ class LogicReasoner:
                     "status": "disproven",
                     "goal": clean_goal,
                     "negation": opposite,
+                    "proof_provenance": sorted(premises),
                 },
             )
-
-        # -----------------------------------------------------
-        # 6. Undetermined.
-        # -----------------------------------------------------
 
         return ReasoningResult(
             valid=False,
             conclusion=None,
-            premises=premises,
+            premises=[],
             steps=steps,
             confidence=0.0,
             metadata={
@@ -246,12 +201,9 @@ class LogicReasoner:
                 "status": "undetermined",
                 "goal": clean_goal,
                 "negation": opposite,
+                "proof_provenance": [],
             },
         )
-
-    # ---------------------------------------------------------
-    # Utility
-    # ---------------------------------------------------------
 
     @staticmethod
     def _clean(value: object) -> str:

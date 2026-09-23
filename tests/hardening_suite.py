@@ -507,6 +507,289 @@ except subprocess.TimeoutExpired:
 
 
 # ------------------------------------------------------------
+# 11. Reasoning isolation + proof provenance
+# ------------------------------------------------------------
+
+section("11) REASONING ISOLATION + PROOF PROVENANCE")
+
+from reasoning.engine import FormalReasoner
+from reasoning.storage import ReasoningStore
+
+
+# Persistent knowledge must NOT leak by default.
+store = ReasoningStore(":memory:")
+store.add_fact("ليلى", "هي", "غائبة")
+store.add_rule(
+    "ليلى هي غائبة",
+    "ليلى هي فاشلة",
+    source="persistent-old",
+)
+
+isolated_reasoner = FormalReasoner(store=store)
+
+isolated = isolated_reasoner.reason(
+    "هل ليلى هي ناجحة؟",
+    context={
+        "facts": ["ليلى هي طالبة"],
+        "rules": [
+            {
+                "premise": "ليلى هي طالبة",
+                "conclusion": "ليلى هي مجتهدة",
+                "source": "current",
+            },
+            {
+                "premise": "ليلى هي مجتهدة",
+                "conclusion": "ليلى هي ناجحة",
+                "source": "current",
+            },
+        ],
+        "goal": "ليلى هي ناجحة",
+    },
+)
+
+if (
+    isolated.valid
+    and isolated.conclusion == "ليلى هي ناجحة"
+    and isolated.premises == ["ليلى هي طالبة"]
+    and all("persistent-old" not in step for step in isolated.steps)
+):
+    ok("persistent knowledge isolation")
+else:
+    fail("persistent knowledge isolation", repr(isolated))
+
+
+# Persistent knowledge may be explicitly enabled.
+persistent = isolated_reasoner.reason(
+    "هل ليلى هي فاشلة؟",
+    context={
+        "use_persistent": True,
+        "goal": "ليلى هي فاشلة",
+    },
+)
+
+if (
+    persistent.valid
+    and persistent.conclusion == "ليلى هي فاشلة"
+    and persistent.premises == ["ليلى هي غائبة"]
+):
+    ok("explicit persistent knowledge")
+else:
+    fail("explicit persistent knowledge", repr(persistent))
+
+
+# Proof premises must exclude unrelated current facts.
+proof = isolated_reasoner.reason(
+    "هل ليلى هي ناجحة؟",
+    context={
+        "facts": [
+            "ليلى هي طالبة",
+            "أحمد هو غني",
+            "سارة هي سعيدة",
+        ],
+        "rules": [
+            {
+                "premise": "ليلى هي طالبة",
+                "conclusion": "ليلى هي ناجحة",
+                "source": "proof-test",
+            }
+        ],
+        "goal": "ليلى هي ناجحة",
+    },
+)
+
+if proof.premises == ["ليلى هي طالبة"]:
+    ok("proof-specific premises")
+else:
+    fail("proof-specific premises", repr(proof))
+
+
+# Contradiction provenance.
+contradiction = isolated_reasoner.reason(
+    "هل ليلى هي ناجحة؟",
+    context={
+        "facts": ["ليلى هي طالبة"],
+        "rules": [
+            {
+                "premise": "ليلى هي طالبة",
+                "conclusion": "ليلى هي ناجحة",
+                "source": "positive",
+            },
+            {
+                "premise": "ليلى هي طالبة",
+                "conclusion": "¬ليلى هي ناجحة",
+                "source": "negative",
+            },
+        ],
+        "goal": "ليلى هي ناجحة",
+    },
+)
+
+if (
+    contradiction.metadata.get("status") == "contradiction"
+    and contradiction.premises == ["ليلى هي طالبة"]
+):
+    ok("contradiction provenance")
+else:
+    fail("contradiction provenance", repr(contradiction))
+
+
+# ------------------------------------------------------------
+# 12. Deterministic randomized reasoning
+# ------------------------------------------------------------
+
+section("12) DETERMINISTIC RANDOMIZED REASONING")
+
+import random
+
+rng = random.Random(20260923)
+
+random_failures = []
+
+for case_id in range(100):
+    subject = f"كيان{case_id}"
+
+    chain_length = rng.randint(1, 8)
+    predicates = [
+        f"صفة_{case_id}_{i}"
+        for i in range(chain_length + 1)
+    ]
+
+    facts = [f"{subject} هو {predicates[0]}"]
+
+    rules = []
+    for i in range(chain_length):
+        rules.append(
+            {
+                "premise": f"{subject} هو {predicates[i]}",
+                "conclusion": f"{subject} هو {predicates[i + 1]}",
+                "source": f"random-{case_id}",
+            }
+        )
+
+    # Add unrelated noise.
+    for noise in range(rng.randint(1, 5)):
+        facts.append(f"ضوضاء{case_id}_{noise} هو غير_مرتبط")
+
+    expected_goal = f"{subject} هو {predicates[-1]}"
+
+    rr = isolated_reasoner.reason(
+        f"هل {expected_goal}؟",
+        context={
+            "facts": facts,
+            "rules": rules,
+            "goal": expected_goal,
+        },
+    )
+
+    if not (
+        rr.valid
+        and rr.conclusion == expected_goal
+        and rr.premises == [facts[0]]
+        and len(rr.steps) == chain_length
+    ):
+        random_failures.append(
+            {
+                "case": case_id,
+                "chain_length": chain_length,
+                "result": repr(rr),
+            }
+        )
+
+if not random_failures:
+    ok("100 randomized reasoning scenarios")
+else:
+    fail(
+        "100 randomized reasoning scenarios",
+        repr(random_failures[:3]),
+    )
+
+
+# ------------------------------------------------------------
+# 13. Randomized negative / missing-link tests
+# ------------------------------------------------------------
+
+section("13) RANDOMIZED NEGATIVE REASONING")
+
+negative_failures = []
+
+for case_id in range(100):
+    subject = f"سلبية{case_id}"
+
+    facts = [f"{subject} هو البداية"]
+
+    rules = [
+        {
+            "premise": f"{subject} هو البداية",
+            "conclusion": f"{subject} هو وسط",
+            "source": "negative-random",
+        }
+    ]
+
+    # Goal deliberately requires a missing second rule.
+    goal = f"{subject} هو نهاية"
+
+    rr = isolated_reasoner.reason(
+        f"هل {goal}؟",
+        context={
+            "facts": facts,
+            "rules": rules,
+            "goal": goal,
+        },
+    )
+
+    if rr.metadata.get("status") != "undetermined":
+        negative_failures.append((case_id, repr(rr)))
+
+if not negative_failures:
+    ok("100 randomized missing-link scenarios")
+else:
+    fail(
+        "100 randomized missing-link scenarios",
+        repr(negative_failures[:3]),
+    )
+
+
+store.close()
+
+
+# ------------------------------------------------------------
+# 14. Formal reasoner repeatability
+# ------------------------------------------------------------
+
+section("14) REASONING REPEATABILITY")
+
+repeat_context = {
+    "facts": ["سليم هو طالب"],
+    "rules": [
+        {
+            "premise": "سليم هو طالب",
+            "conclusion": "سليم هو مجتهد",
+            "source": "repeat",
+        },
+        {
+            "premise": "سليم هو مجتهد",
+            "conclusion": "سليم هو ناجح",
+            "source": "repeat",
+        },
+    ],
+    "goal": "سليم هو ناجح",
+}
+
+r1 = isolated_reasoner.reason("هل سليم هو ناجح؟", context=repeat_context)
+r2 = isolated_reasoner.reason("هل سليم هو ناجح؟", context=repeat_context)
+
+if (
+    r1.valid == r2.valid
+    and r1.conclusion == r2.conclusion
+    and r1.premises == r2.premises
+    and r1.steps == r2.steps
+    and r1.metadata.get("status") == r2.metadata.get("status")
+):
+    ok("deterministic repeatability")
+else:
+    fail("deterministic repeatability", f"r1={r1!r} r2={r2!r}")
+
+# ------------------------------------------------------------
 # Final report
 # ------------------------------------------------------------
 

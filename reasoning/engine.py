@@ -1,17 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-reasoning/engine.py
+MiniChat v3 — Formal Reasoner
 
-واجهة MiniChat الرسمية لمحرك الاستدلال المنطقي.
+Persistent knowledge is NOT injected into every request.
 
-المسؤوليات:
-- تطبيق عقد Reasoner.
-- تحميل المعرفة المخزنة من ReasoningStore.
-- دمج حقائق وقواعد الطلب الحالي.
-- تشغيل LogicReasoner مستقل لكل طلب.
-- إعادة ReasoningResult قابل للتتبع.
+Default:
+    current request context only.
 
-هذه الطبقة لا تصوغ الإجابة للمستخدم.
+Optional:
+    context["use_persistent"] = True
+
+This keeps persistent knowledge an explicit source instead of
+an implicit global working memory.
 """
 
 from __future__ import annotations
@@ -25,8 +25,6 @@ from reasoning.storage import ReasoningStore
 
 
 class FormalReasoner(Reasoner):
-    """واجهة الاستدلال المنطقي الرسمي."""
-
     name = "formal-reasoner"
 
     def __init__(
@@ -39,13 +37,9 @@ class FormalReasoner(Reasoner):
 
         self.max_depth = max_depth
         self.store = store
-
-        # يحتفظ به للتوافق مع الاستخدامات القديمة.
-        # الاستدلال الفعلي يستخدم محركًا جديدًا لكل طلب.
         self.logic = LogicReasoner(max_depth=max_depth)
 
     def parse_and_add_fact(self, text: str) -> Optional[str]:
-        """تحليل حقيقة عربية وإضافتها إلى التخزين أو الذاكرة."""
         from reasoning.parser import ArabicLogicParser
 
         parsed = ArabicLogicParser().parse_fact(text)
@@ -76,13 +70,12 @@ class FormalReasoner(Reasoner):
         rules = context.get("rules", [])
         goal = context.get("goal")
 
-        # محرك مستقل لكل طلب لمنع تسرب حالة طلب سابق.
         engine = LogicReasoner(max_depth=self.max_depth)
 
-        # ---------------------------------------------
-        # المعرفة الدائمة
-        # ---------------------------------------------
-        if self.store is not None:
+        # Persistent knowledge is opt-in.
+        use_persistent = context.get("use_persistent") is True
+
+        if use_persistent and self.store is not None:
             engine.add_facts(self.store.get_facts())
 
             for stored_rule in self.store.get_rules():
@@ -92,9 +85,6 @@ class FormalReasoner(Reasoner):
                     source=stored_rule["source"],
                 )
 
-        # ---------------------------------------------
-        # حقائق الطلب الحالي
-        # ---------------------------------------------
         if isinstance(facts, (list, tuple, set)):
             engine.add_facts(
                 fact
@@ -102,9 +92,6 @@ class FormalReasoner(Reasoner):
                 if isinstance(fact, str)
             )
 
-        # ---------------------------------------------
-        # قواعد الطلب الحالي
-        # ---------------------------------------------
         if isinstance(rules, (list, tuple)):
             for rule in rules:
                 if not isinstance(rule, dict):
@@ -126,9 +113,6 @@ class FormalReasoner(Reasoner):
                     source=source if isinstance(source, str) else None,
                 )
 
-        # ---------------------------------------------
-        # الهدف
-        # ---------------------------------------------
         if not isinstance(goal, str) or not goal.strip():
             goal = None
 
@@ -143,6 +127,7 @@ class FormalReasoner(Reasoner):
                 "query": query,
                 "formal": True,
                 "persistent_store": self.store is not None,
+                "persistent_used": use_persistent and self.store is not None,
             }
         )
 
