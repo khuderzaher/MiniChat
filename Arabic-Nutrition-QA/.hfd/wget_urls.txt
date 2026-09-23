@@ -1,0 +1,4 @@
+https://hf-mirror.com/datasets/moazeldegwy/Arabic-Nutrition-QA/resolve/main/.gitattributes
+https://hf-mirror.com/datasets/moazeldegwy/Arabic-Nutrition-QA/resolve/main/README.md
+https://hf-mirror.com/datasets/moazeldegwy/Arabic-Nutrition-QA/resolve/main/data/test-00000-of-00001.parquet
+https://hf-mirror.com/datasets/moazeldegwy/Arabic-Nutrition-QA/resolve/main/data/train-00000-of-00001.parquet

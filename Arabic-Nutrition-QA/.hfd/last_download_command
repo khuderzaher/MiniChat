@@ -1,0 +1,1 @@
+REPO_ID=moazeldegwy/Arabic-Nutrition-QA TOOL=wget INCLUDE= EXCLUDE= DATASET=1 HF_USERNAME= HF_TOKEN= HF_ENDPOINT=https://hf-mirror.com REVISION=main

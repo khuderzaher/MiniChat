@@ -1,0 +1,74 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets / environment
+.env
+.env.*
+*.secret
+*.key
+*.pem
+
+# Local models / huge binaries
+*.gguf
+*.ggml
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Local databases / runtime state
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Caches / serialized runtime state
+*.pkl
+*.pickle
+*.cache
+
+# Local chatbot databases
+minichat_db.json
+minichat_db.json.bak*
+minichat_memory.pkl
+semantic_cache.pkl
+root_index_cache.pkl
+
+# Temporary / logs
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+
+# Generated backups / snapshots
+*.bak
+*.backup
+*.old
+
+# Large local datasets
+*.parquet
+
+# Local dataset directories
+Arabic-Nutrition-QA/data/
+organic-levantine-arabic-dialect-dataset/
+
+# Termux / editor noise
+.DS_Store
+Thumbs.db
+
+# Project-local development artifacts
+dist/
+build/
+*.egg-info/
+
+# Explicitly local files
+local/
+runtime_data/

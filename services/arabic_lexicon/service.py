@@ -1,0 +1,189 @@
+# -*- coding: utf-8 -*-
+"""
+services/arabic_lexicon/service.py — واجهة خدمة المعجم العربي.
+
+ترجمة العملية الصرفية إلى فئة قاموس + ترجيح ذكي مبني على البيانات.
+لا تخترع. لا تجيب إلا إذا وُجدت البيانات.
+
+البروتوكول: handle(query, context) -> Result | None
+"""
+import re
+from typing import Optional
+
+from ..protocol import Result, Service
+from .reader import Reader
+
+
+# خريطة: صياغات عربية → فئة القاموس
+OPERATION_PATTERNS = [
+    # اسم الفاعل
+    (re.compile(r"اسم\s+الفاعل|اسم\s+فاعل|الفاعل\s+من"), "فاعل", "active_participle"),
+    # اسم المفعول
+    (re.compile(r"اسم\s+المفعول|اسم\s+مفعول|المفعول\s+من"), "مفعول", "passive_participle"),
+    # المصدر
+    (re.compile(r"\bالمصدر\b|\bمصدر\b"), "مصدر", "masdar"),
+]
+
+
+def _detect_operation(text: str):
+    """يعيد (category, operation_name) أو (None, None)."""
+    for pat, cat, name in OPERATION_PATTERNS:
+        if pat.search(text):
+            return cat, name
+    return None, None
+
+
+def _extract_word(text: str) -> Optional[str]:
+    """
+    يستخرج الكلمة المطلوب اشتقاقها.
+    الأنماط المدعومة:
+      - 'ما هو اسم الفاعل من كتب'
+      - 'اسم الفاعل من كتب'
+      - 'صغ من الفعل كتب'
+      - 'ما هو المصدر من كتب'
+    """
+    # بعد "من" أو "من الفعل"
+    m = re.search(r"من\s+(?:الفعل\s+)?([\u0600-\u06FF]+)", text)
+    if m:
+        w = m.group(1).strip("؟?،. ")
+        if w and w not in ("الفعل",):
+            return w
+    return None
+
+
+class ArabicLexiconService(Service):
+    name = "arabic_lexicon"
+
+    def __init__(self, reader: Optional[Reader] = None):
+        self.reader = reader or Reader()
+
+    # ---------- الرجيح ----------
+
+    def _score(self, entry: dict, root: str) -> int:
+        """
+        ترجيح مبني على بيانات القاموس.
+        القواعد المطبَّقة (كلها مشتقة من البيانات الحقيقية):
+          +3  : original فعل ثلاثي مجرد من نفس الجذر
+          +2  : number == 'مفرد'
+          +1  : category صريحة (وليس '')
+        """
+        s = 0
+        orig = (entry.get("original") or "").strip()
+        if orig and root:
+            # هل original فعل ثلاثي مجرد بنفس الجذر؟
+            first = self.reader.entries(orig)["verbs"]
+            for v in first:
+                if v.get("vocalized") == orig and v.get("triliteral") == 1:
+                    s += 3
+                    break
+        if entry.get("number") == "مفرد":
+            s += 2
+        if entry.get("category"):
+            s += 1
+        return s
+
+    # ---------- الواجهة العامة ----------
+
+    def handle(self, query, context=None):
+        if not query:
+            return None
+
+        cat, op_name = _detect_operation(query)
+        if not cat:
+            return None
+
+        word = _extract_word(query)
+        if not word:
+            return None
+
+        # 0) تحقق: هل الكلمة فعل في القاموس؟
+        #    (لا نشتق من اسم، ولا نخمّن جذرًا لغير الفعل)
+        if not any(v.get("triliteral") == 1 for v in self.reader.entries(word)["verbs"]):
+            return Result(
+                handled=True,
+                answer=None,
+                source="arabic_lexicon:not_a_verb",
+                confidence=0.0,
+                metadata={"input": word, "operation": op_name},
+            )
+
+        # 1) جذر الكلمة — من القاموس نفسه
+        roots = self.reader.root_of(word)
+        if not roots:
+            return Result(
+                handled=True,
+                answer=None,
+                source="arabic_lexicon:no_root",
+                confidence=0.0,
+                metadata={"input": word, "operation": op_name},
+            )
+
+        # 2) اجمع كل المرشحين من كل جذر ممكن
+        candidates = []
+        for root in roots:
+            for entry in self.reader.by_category(root, cat):
+                candidates.append((root, entry))
+
+        if not candidates:
+            return Result(
+                handled=True,
+                answer=None,
+                source="arabic_lexicon:no_entry",
+                confidence=0.0,
+                metadata={"input": word, "operation": op_name, "roots": roots},
+            )
+
+        # 3) رجّح
+        scored = []
+        for root, entry in candidates:
+            s = self._score(entry, root)
+            scored.append((s, root, entry))
+        scored.sort(key=lambda x: -x[0])
+
+        best_score, best_root, best = scored[0]
+        answer = (best.get("vocalized") or "").strip()
+
+        return Result(
+            handled=True,
+            answer=answer,
+            source="arabic_lexicon:" + op_name,
+            confidence=min(0.99, 0.5 + 0.1 * best_score),
+            metadata={
+                "input": word,
+                "operation": op_name,
+                "root": best_root,
+                "original": best.get("original"),
+                "number": best.get("number"),
+                "alternatives": [
+                    {"word": e.get("vocalized"), "root": r, "orig": e.get("original")}
+                    for _, r, e in scored[1:5]
+                ],
+            },
+        )
+
+
+if __name__ == "__main__":
+    svc = ArabicLexiconService()
+
+    tests = [
+        "ما هو اسم الفاعل من كتب؟",
+        "ما هو اسم المفعول من كتب؟",
+        "ما هو المصدر من كتب؟",
+        "اسم الفاعل من شرب",
+        "اسم المفعول من شرب",
+        "ما هو اسم الفاعل من قرأ؟",
+        "ما هو اسم الفاعل من كوكب؟",   # كلمة ليست فعلًا
+        "ما هي عاصمة مصر؟",              # ليست سؤالًا صرفيًا
+    ]
+    for q in tests:
+        r = svc.handle(q)
+        if r is None:
+            print("[%s] -> None (ليس سؤالًا صرفيًا)" % q)
+        else:
+            print("[%s]" % q)
+            print("   handled=%s conf=%.2f source=%s" % (
+                bool(r), r.confidence, r.source))
+            print("   answer  = %r" % r.answer)
+            if r.metadata.get("alternatives"):
+                print("   alts    = %d بدائل" % len(r.metadata["alternatives"]))
+            print()

@@ -1,0 +1,2946 @@
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+ MiniChat-AI v2.3 — محرك محادثة هجين متعدد الأنماط
+================================================================================
+الملفات:
+  - minichat_db.json          : قاعدة المعرفة (تُقرأ فقط)
+  - minichat_memory.pkl       : الذاكرة والتعلم التلقائي
+  - minichat_patterns.json    : الأنماط المستخرجة من التدريب
+  - minichat_export.json      : تصدير اختياري للذاكرة
+
+الرموز:
+  ~تدريب [N]   : استخراج أنماط من الحوار
+  ~ذاكرة       : عرض ما تعلمه البوت
+  ~مذاكرة      : مراجعة شاملة (ذاكرة + أنماط)
+  ~إحصاء       : إحصائيات
+  ~عرض         : عرض محتوى الملفات
+  ~تصدير       : تصدير الذاكرة إلى JSON
+  ~حفظ         : حفظ فوري
+  ~تصفير       : مسح الذاكرة والأنماط
+  ~مساعدة      : دليل شامل
+  ~خروج        : إنهاء
+================================================================================
+"""
+from __future__ import print_function
+
+import os
+import re
+import sys
+import json
+import time
+import random
+import pickle
+import hashlib
+import argparse
+import shutil
+from functools import partial
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+from typing import List
+
+# محرك الإدراك المتقدم
+try:
+    from cognition_v2 import get_cognition_v2
+except Exception as _e:
+    print("[WARN] cognition_v2: %s" % _e)
+    get_cognition_v2 = None
+
+# محركات متقدمة
+try:
+    from derivation_engine import RootExtractor, RootIndex
+    from smart_summarizer import SmartSummarizer
+    from practical_tools import PracticalTools
+except Exception as _e:
+    print("[WARN] new engines: %s" % _e)
+    RootExtractor = RootIndex = None
+    SmartSummarizer = None
+    PracticalTools = None
+
+# محركات متقدمة
+try:
+    from linguistic_engine import SentenceAnalyzer, ArabicMorphology
+    from fuzzy_matcher import correct_sentence, correct_word
+    from deep_reasoner import DeepReasoner
+    from math_engine import MathEngine
+    from output_formatter import Formatter
+except Exception as _e:
+    print("[WARN] advanced engines: %s" % _e)
+    SentenceAnalyzer = ArabicMorphology = None
+    correct_sentence = correct_word = None
+    DeepReasoner = None
+    MathEngine = None
+    Formatter = None
+
+
+# الشبكة المعرفية
+try:
+    from knowledge_graph import get_knowledge_graph
+except Exception as _e:
+    print("[WARN] knowledge_graph: %s" % _e)
+    get_knowledge_graph = None
+
+# محرك المزاج
+try:
+    from mood_engine import detect_mood
+    from mood_responses import get_opener, get_closer
+except Exception as _e:
+    print("[WARN] mood_engine: %s" % _e)
+    detect_mood = None
+    get_opener = None
+    get_closer = None
+
+# جسر LLM + RAG
+try:
+    from llm_bridge import ask as llm_ask, is_server_up
+    from rag_bridge import rag_answer, polish_answer
+except Exception as _e:
+    print("[WARN] llm_bridge: %s" % _e)
+    llm_ask = None
+    is_server_up = None
+    rag_answer = None
+    polish_answer = None
+
+# تتبع السياق
+try:
+    from context_tracker import get_tracker, ContextTracker
+except Exception as _e:
+    print("[WARN] context_tracker: %s" % _e)
+    get_tracker = None
+    ContextTracker = None
+
+# محرك الإدراك
+import traceback
+try:
+    from cognition import get_cognition
+except Exception as _e:
+    print('[WARN] cognition import failed: %s' % _e)
+    get_cognition = None
+
+try:
+    from reasoning import get_engine
+except Exception:
+    get_engine = None
+
+print = partial(print, flush=True)
+
+
+# ═══════════════════════════════════════════════════════════════
+# فلاتر المدخل
+# ═══════════════════════════════════════════════════════════════
+import re as _re_g
+
+# مواضيع حساسة — تُرفض بلطف
+SENSITIVE_TOPICS = [
+    "من هو الله", "ما هو الله", "اين الله", "أين الله",
+    "هل الله موجود", "هل يوجد اله", "شكل الله", "صورة الله",
+    "من هو الشيطان", "ما هو الشيطان", "من هو ابليس",
+    "ما هي الروح", "اين تذهب الروح", "ما هو الجحيم",
+    "ما هي القيامة", "متى يوم القيامة", "هل هناك حياه بعد الموت",
+    "من هو النبي", "من هو محمد", "كيف شكل النبي",
+    "من هو يسوع", "من هو المسيح", "ما هو الدين الصحيح",
+    "ما هو افضل دين", "ما هو افضل مذهب",
+]
+
+SENSITIVE_REPLY = (
+    "هذا سؤال ديني عميق يتطلب معرفة متخصصة.\n"
+    "أنصحك بمراجعة أهل العلم الموثوقين في بلدك،\n"
+    "فأنا لا أملك الجرأة على الخوض في هذه المسائل."
+)
+
+
+def _is_garbage(text):
+    """يكتشف المدخل غير المفيد."""
+    if not text:
+        return True
+    t = text.strip()
+    # استثناءات: أوامر ومفردات قصيرة معروفة
+    if t in ("+", "-", "جيد", "سيء", "good", "bad"):
+        return False
+    if len(t) < 2:
+        return True
+
+    # 1) تعبير رياضي — ليس garbage
+    if _re_g.match(r"^[\s\d+\-*/().^%×÷=xX]+$", t):
+        return False
+
+    # 1.b) نسبة مئوية عربية (10% من 250)
+    if _re_g.match(r"^\s*\d+(\.\d+)?\s*%\s*(من|من اصل|من أصل)?\s*\d+", t):
+        return False
+    if _re_g.search(r"\d+\s*%\s*من\s*\d+", t):
+        return False
+
+    # 2) كلمات إنجليزية كاملة
+    if _re_g.match(r"^[a-zA-Z\s\.,!\?]+$", t) and len(t) <= 40:
+        return False
+
+    # 3) إحصاء
+    arabic = len(_re_g.findall(r"[\u0600-\u06FF]", t))
+    latin = len(_re_g.findall(r"[a-zA-Z]", t))
+    total = len(_re_g.sub(r"\s", "", t))
+    if total == 0:
+        return True
+
+    # 4) أقل من 3 أحرف عربية = garbage
+    if arabic < 3:
+        return True
+
+    # 5) نسبة عربية أقل من 50% مع لاتيني
+    if arabic / total < 0.5 and latin > 2:
+        return True
+
+    # 6) عربية قليلة ونص طويل
+    if arabic < 4 and total > 10:
+        return True
+
+    # 7) تكرار حرف غريب
+    if _re_g.search(r"(.)\1{4,}", t):
+        return True
+
+    # 8) أي كلمة ≥ 4 أحرف كلها لاتينية/أرقام → garbage
+    for word in t.split():
+        if len(word) >= 4 and _re_g.match(r"^[a-zA-Z0-9]+$", word):
+            return True
+
+    return False
+
+    # 2) كلمات إنجليزية كاملة
+    if _re_g.match(r"^[a-zA-Z\s\.,!\?]+$", t) and len(t) <= 40:
+        return False
+
+    # 3) إحصاء
+    arabic = len(_re_g.findall(r"[\u0600-\u06FF]", t))
+    latin = len(_re_g.findall(r"[a-zA-Z]", t))
+    total = len(_re_g.sub(r"\s", "", t))
+    if total == 0:
+        return True
+
+    # 4) أقل من 3 أحرف عربية = garbage
+    if arabic < 3:
+        return True
+
+    # 5) نسبة عربية أقل من 50% مع لاتيني
+    if arabic / total < 0.5 and latin > 2:
+        return True
+
+    # 6) عربية قليلة ونص طويل
+    if arabic < 4 and total > 10:
+        return True
+
+    # 7) تكرار حرف غريب
+    if _re_g.search(r"(.)\1{4,}", t):
+        return True
+
+    # 8) أي كلمة ≥ 4 أحرف كلها لاتينية/أرقام → garbage
+    for word in t.split():
+        if len(word) >= 4 and _re_g.match(r"^[a-zA-Z0-9]+$", word):
+            return True
+
+    return False
+
+
+def _is_sensitive(text):
+    """يكتشف المواضيع الحساسة."""
+    t = normalize_arabic_text(text)
+    for s in SENSITIVE_TOPICS:
+        if normalize_arabic_text(s) in t:
+            return True
+    return False
+
+
+def normalize_arabic_text(text):
+    """تطبيع بسيط للمقارنة."""
+    if not text:
+        return ""
+    t = text.strip().lower()
+    t = _re_g.sub(r"[\u064B-\u065F\u0670]", "", t)
+    t = _re_g.sub(r"[إأآا]", "ا", t)
+    t = t.replace("ى", "ي").replace("ة", "ه")
+    t = _re_g.sub(r"\s+", " ", t)
+    return t.strip()
+
+
+
+# ═══════════════════════════════════════════════════════════════
+# Helper functions لمحرك الرياضيات
+# ═══════════════════════════════════════════════════════════════
+import re as _re_mod
+
+def _re_search_eq(text):
+    """يبحث عن معادلة خطية في النص."""
+    import re as _r
+    m = _r.search(r"(-?\d*[a-zA-Z]\s*[+-]?\s*\d*\s*=\s*-?\d+)", text)
+    if m:
+        return m.group(1).replace(" ", "")
+    return None
+
+def _re_search_expr(text):
+    """يبحث عن تعبير رياضي بسيط."""
+    import re as _r
+    m = _r.search(r"(-?\d+(?:\s*[+\-*/×÷]\s*\d+)+)", text)
+    if m:
+        return m.group(1)
+    return None
+
+
+
+# =============================================================================
+# 🔧 إصلاح JSON تلقائي
+# =============================================================================
+def _strip_hidden(text):
+    return (text.replace("\ufeff", "")
+                .replace("\u200b", "").replace("\u200c", "")
+                .replace("\u200d", "").replace("\u00a0", " ")
+                .replace("\u201c", '"').replace("\u201d", '"')
+                .replace("\u2018", "'").replace("\u2019", "'"))
+
+
+def _count_braces(text):
+    oc = cc = os_ = cs = 0
+    in_str = False
+    esc = False
+    for ch in text:
+        if esc:
+            esc = False
+            continue
+        if ch == "\\" and in_str:
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            oc += 1
+        elif ch == "}":
+            cc += 1
+        elif ch == "[":
+            os_ += 1
+        elif ch == "]":
+            cs += 1
+    return oc, cc, os_, cs
+
+
+def _general_fix(text):
+    text = re.sub(r",\s*,", ",", text)
+    text = re.sub(r",(\s*[}\]])", r"\1", text)
+    return text
+
+
+def _insert_commas(text):
+    lines = text.split("\n")
+    fixed = 0
+    for i in range(len(lines) - 1):
+        cur = lines[i].rstrip()
+        if not cur or cur.endswith((",", "{", "[", ":")):
+            continue
+        j = i + 1
+        while j < len(lines) and not lines[j].strip():
+            j += 1
+        if j >= len(lines):
+            break
+        nxt = lines[j].lstrip()
+        if not nxt or not nxt.startswith(('"', "{", "[")):
+            continue
+        if cur.endswith(("}", "]")) and nxt.startswith(("}", "]")):
+            continue
+        lines[i] = cur + ","
+        fixed += 1
+    return "\n".join(lines), fixed
+
+
+def repair_json_file(path, verbose=True):
+    p = Path(path)
+    if not p.exists():
+        if verbose:
+            print("[JSONRepair] الملف غير موجود: %s" % p)
+        return False
+
+    raw = p.read_text(encoding="utf-8")
+
+    try:
+        json.loads(raw)
+        if verbose:
+            print("[JSONRepair] ✅ الملف سليم أصلًا.")
+        return True
+    except json.JSONDecodeError as e:
+        col = getattr(e, "colno", None) or getattr(e, "pos", "?")
+        if verbose:
+            print("[JSONRepair] ⚠️ خلل: %s @ %s:%s" % (e.msg, e.lineno, col))
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    bp = p.with_name("%s.backup_%s.json" % (p.stem, ts))
+    try:
+        shutil.copy2(p, bp)
+        if verbose:
+            print("[JSONRepair] 🔒 نسخة احتياطية: %s" % bp.name)
+    except Exception as ex:
+        if verbose:
+            print("[JSONRepair] تحذير نسخ: %s" % ex)
+
+    text = _general_fix(_strip_hidden(raw))
+
+    try:
+        data = json.loads(text)
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                     encoding="utf-8")
+        if verbose:
+            print("[JSONRepair] ✅ إصلاح بعد التنظيف.")
+        return True
+    except json.JSONDecodeError:
+        pass
+
+    text2, n = _insert_commas(text)
+    if n:
+        try:
+            data = json.loads(text2)
+            p.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                         encoding="utf-8")
+            if verbose:
+                print("[JSONRepair] ✅ إصلاح بإضافة %d فاصلة." % n)
+            return True
+        except json.JSONDecodeError:
+            text = text2
+
+    oc, cc, os_, cs = _count_braces(text)
+    curly_def = oc - cc
+    square_def = os_ - cs
+    if verbose:
+        print("[JSONRepair] توازن: {=%d/%d (فرق %d)، [=%d/%d (فرق %d)"
+              % (oc, cc, curly_def, os_, cs, square_def))
+
+    if curly_def > 0 or square_def > 0:
+        candidate = text.rstrip()
+        if square_def > 0:
+            candidate = candidate.rstrip("}").rstrip()
+            candidate += ("]" * square_def) + ("}" * max(curly_def, 0))
+        elif curly_def > 0:
+            if candidate.endswith("}"):
+                candidate = candidate[:-1].rstrip() + ("}" * curly_def) + "}"
+            else:
+                candidate = candidate + ("}" * curly_def)
+        try:
+            data = json.loads(candidate)
+            p.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                         encoding="utf-8")
+            if verbose:
+                print("[JSONRepair] ✅ إصلاح بإضافة %d } و %d ]."
+                      % (max(curly_def, 0), max(square_def, 0)))
+            return True
+        except json.JSONDecodeError as e:
+            col = getattr(e, "colno", None) or getattr(e, "pos", "?")
+            if verbose:
+                print("[JSONRepair] لم تنجح الإضافة: %s @ %s:%s"
+                      % (e.msg, e.lineno, col))
+
+    if verbose:
+        print("[JSONRepair] ❌ تعذر الإصلاح التلقائي.")
+    return False
+
+
+def ensure_db_ready(db_path="minichat_db.json"):
+    if not os.path.exists(db_path):
+        return
+    try:
+        with open(db_path, "r", encoding="utf-8") as f:
+            json.load(f)
+        return
+    except json.JSONDecodeError:
+        pass
+    repair_json_file(db_path, verbose=True)
+
+
+# =============================================================================
+# 0) الإعدادات
+# =============================================================================
+CONFIG = {
+    "db_file": "minichat_db.json",
+    "memory_file": "minichat_memory.pkl",
+    "patterns_file": "minichat_patterns.json",
+    "export_file": "minichat_export.json",
+    "seed": 1337,
+    "memory_max_history": 2000,
+    "retrieval_threshold": 0.55,   # ← رُفِع من 0.35 لمنع الإجابات الخاطئة
+}
+
+DEBUG = False
+
+
+# =============================================================================
+# كلمات الوقف — لا تُحسب في التشابه
+# =============================================================================
+STOPWORDS = {
+    # عربية
+    "ما", "هو", "هي", "من", "في", "على", "عن", "إلى", "الى",
+    "و", "أو", "او", "ثم", "لكن", "بل", "لا", "لم", "لن",
+    "هذا", "هذه", "ذلك", "تلك", "التي", "الذي", "الذين",
+    "كان", "كانت", "يكون", "تكون", "هل", "قد", "كل", "بعض",
+    "أي", "اي", "كيف", "متى", "أين", "اين", "لماذا",
+    "أخبرني", "اخبرني", "عرفني", "أعطني", "اعطني",
+    "قل", "لي", "أنا", "انا", "أنت", "انت", "نحن", "هم",
+    # إنجليزية
+    "the", "a", "an", "is", "are", "was", "were", "of", "to",
+    "in", "on", "at", "for", "and", "or", "but", "with",
+    "what", "which", "who", "whom", "this", "that", "these",
+    "those", "be", "been", "being", "have", "has", "had",
+    "do", "does", "did", "will", "would", "could", "should",
+    "tell", "me", "about",
+}
+
+
+# =============================================================================
+# 1) أدوات
+# =============================================================================
+def set_seed(s):
+    random.seed(s)
+
+
+def trace(msg):
+    if DEBUG:
+        print("[TRACE] %s" % msg)
+
+
+def normalize(text):
+    if text is None:
+        return ""
+    t = text.strip().lower()
+    t = re.sub(r"[\u064B-\u065F\u0670]", "", t)
+    t = t.replace("\u0671", "\u0627")  # ٱ → ا
+    t = t.replace("\u0672", "\u0627")  # ٲ → ا
+    t = t.replace("\u0673", "\u0627")  # ٳ → ا
+    t = re.sub(r"[إأآا]", "ا", t)
+    t = t.replace("ى", "ي").replace("ئ", "ي").replace("ؤ", "و")
+    t = re.sub(r"\s+", " ", t)
+    return t.strip()
+
+
+def is_arabic(text):
+    return bool(re.search(r"[\u0600-\u06FF]", text or ""))
+
+
+def _wrap_text(text, width=60):
+    """يقسم النص الطويل لأسطر قصيرة لتجنب مشاكل Terminal."""
+    if not text:
+        return text
+    if "\n" in text:
+        return text
+    words = text.split()
+    lines = []
+    cur = ""
+    for w in words:
+        if len(cur) + len(w) + 1 <= width:
+            cur = (cur + " " + w).strip()
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return "\n".join(lines)
+
+
+def _strip_al(word):
+    al = "\u0627\u0644"
+    if len(word) > 3 and word.startswith(al):
+        return word[2:]
+    return word
+
+
+def simple_tokens(text):
+    """يُزيل كلمات الوقف من المقارنة، مع الحفاظ على الحروف المهمة."""
+    t = normalize(text)
+    t = re.sub(r"([\.,!\?;:،؟])", r" \1 ", t)
+    words = [w for w in t.split() if w]
+    # كلمات تدل على أن الحرف التالي مهم
+    CONTEXT_TRIGGERS = ("فيتامين", "نوع", "نوعيه", "فصيله", "درجه", "مرحله", "سوره", "ايه", "شكل", "حرف")
+    # الحروف المفردة المهمة (فيتامينات، تصنيفات)
+    KEEP_SINGLE = {"د", "س", "ب", "ج", "ك", "هـ", "أ", "إ", "آ", "و", "ي", "ط", "ص", "ع", "م", "ن", "ف", "ق", "ر", "ت", "ز", "ح", "خ", "ذ", "ش", "ض", "ظ", "غ", "ث"}
+    content = []
+    prev_word = ""
+    for w in words:
+        wc = _strip_al(w)
+        # هل الكلمة السابقة محفّز؟
+        trigger = any(t in prev_word for t in CONTEXT_TRIGGERS)
+        if len(wc) > 1:
+            if wc not in STOPWORDS:
+                content.append(wc)
+            prev_word = wc
+            continue
+        # حرف مفرد: احفظه فقط إذا كان في سياق مهم
+        if trigger and w in KEEP_SINGLE:
+            content.append(w)
+        prev_word = wc
+    return content if content else words
+
+
+def jaccard(a, b):
+    sa, sb = set(a), set(b)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / float(len(sa | sb))
+
+
+def hash_key(s):
+    return hashlib.md5(normalize(s).encode("utf-8")).hexdigest()[:16]
+
+
+def atomic_write_bytes(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def atomic_write_text(path, text):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+# =============================================================================
+# 2) StructuredDB
+# =============================================================================
+DB_SKELETON = {
+    "version": "2.3",
+    "language_priority": ["ar", "en"],
+    "safety": {
+        "profanity": [],
+        "harm_patterns": [],
+        "safe_reply": "أفضّل ألا أخوض في هذا الموضوع."
+    },
+    "commands": {
+        "help": ["مساعدة", "help"],
+        "stats": ["احصائيات", "stats"],
+        "reset": ["تصفير", "reset"],
+        "remember": ["تذكر", "remember", "احفظ"],
+        "forget": ["انس", "forget", "احذف"],
+        "name": ["اسمي", "my name is"],
+        "feedback": ["+", "-", "جيد", "سيء", "good", "bad"]
+    },
+    "intents": [],
+    "faq": [],
+    "topics": {},
+    "synonyms": {},
+    "fallbacks_ar": ["لم أفهم، أعد صياغة سؤالك."],
+    "fallbacks_en": ["I didn't get that. Could you rephrase?"]
+}
+
+_MERGEABLE_LIST_KEYS = ("intents", "faq", "fallbacks_ar", "fallbacks_en")
+_MERGEABLE_DICT_KEYS = ("topics", "synonyms")
+
+
+def merge_versioned_data(data):
+    if not isinstance(data, dict):
+        return data
+    pattern = re.compile(r"^([a-z_]+)_v(\d+)$")
+    for key in list(data.keys()):
+        m = pattern.match(key)
+        if not m:
+            continue
+        base = m.group(1)
+        extra = data.get(key)
+        if extra is None:
+            continue
+        if base in _MERGEABLE_LIST_KEYS:
+            if not isinstance(data.get(base), list):
+                data[base] = []
+            if isinstance(extra, list):
+                data[base].extend(extra)
+        elif base in _MERGEABLE_DICT_KEYS:
+            if not isinstance(data.get(base), dict):
+                data[base] = {}
+            if isinstance(extra, dict):
+                for k, v in extra.items():
+                    if k not in data[base]:
+                        data[base][k] = v
+                    else:
+                        if isinstance(data[base][k], dict) and isinstance(v, dict):
+                            data[base][k].update(v)
+                        elif isinstance(data[base][k], list) and isinstance(v, list):
+                            data[base][k].extend(v)
+    return data
+
+
+class StructuredDB(object):
+    def __init__(self, path=CONFIG["db_file"]):
+        self.path = path
+        self.data = {}
+        self._compiled_intents = []
+        self._compiled_harm = []
+        self._load()
+        self._compile()
+        # محرك الإدراك معطّل: لم يعد له استخدام فعلي بعد إزالة 6.b
+        # (يوفّر ~28 MB RAM + وقت إقلاع). يُعاد تفعيله عند الحاجة.
+        self.cognition = None
+
+    def _load(self):
+        if os.path.exists(self.path):
+            ensure_db_ready(self.path)
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    self.data = json.load(f)
+                if not isinstance(self.data, dict):
+                    raise ValueError("جذر قاعدة البيانات يجب أن يكون كائن JSON")
+                self.data = merge_versioned_data(self.data)
+                print("[DB] تم تحميل قاعدة البيانات: %s" % self.path)
+                return
+            except (IOError, OSError, ValueError, TypeError) as e:
+                print("[DB] فشل تحميل %s: %s" % (self.path, e))
+                raise RuntimeError("تعذر تحميل قاعدة البيانات: %s" % e)
+        self.data = json.loads(json.dumps(DB_SKELETON))
+        self._save()
+        print("[DB] تم إنشاء هيكل فارغ: %s" % self.path)
+
+    def _save(self):
+        atomic_write_text(self.path, json.dumps(
+            self.data, ensure_ascii=False, indent=2))
+
+    def _compile(self):
+        self._compiled_intents = []
+        for it in self.data.get("intents", []):
+            if not isinstance(it, dict):
+                continue
+            for pat in it.get("patterns", []):
+                if not isinstance(pat, str):
+                    continue
+                try:
+                    rx = re.compile(pat, re.IGNORECASE | re.UNICODE)
+                    self._compiled_intents.append((rx, it))
+                except re.error:
+                    pass
+        self._compiled_intents.sort(
+            key=lambda x: -int(x[1].get("priority", 50)))
+
+        self._compiled_harm = []
+        for pat in self.data.get("safety", {}).get("harm_patterns", []):
+            try:
+                self._compiled_harm.append(
+                    re.compile(pat, re.IGNORECASE | re.UNICODE))
+            except re.error:
+                pass
+
+    def match_intent(self, text):
+        t = normalize(text)
+        for rx, it in self._compiled_intents:
+            try:
+                if rx.search(t):
+                    return it
+            except Exception:
+                continue
+        return None
+
+    def is_unsafe(self, text):
+        t = normalize(text)
+        for p in self.data.get("safety", {}).get("profanity", []):
+            if p and p in t:
+                return True
+        for rx in self._compiled_harm:
+            try:
+                if rx.search(t):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def safe_reply(self):
+        return self.data.get("safety", {}).get(
+            "safe_reply", "لا أستطيع مساعدتك في هذا الموضوع.")
+
+    def faq_entries(self):
+        return self.data.get("faq", [])
+
+    def topic_for(self, text):
+        t = normalize(text)
+        for _, topic in self.data.get("topics", {}).items():
+            if not isinstance(topic, dict):
+                continue
+            for kw in topic.get("keywords", []):
+                if kw and normalize(kw) in t:
+                    return topic
+        return None
+
+    def fallbacks(self, lang):
+        key = "fallbacks_ar" if lang == "ar" else "fallbacks_en"
+        fb = self.data.get(key, ["..."])
+        return fb if fb else ["..."]
+
+
+# =============================================================================
+# 3) MemoryStore
+# =============================================================================
+class MemoryStore(object):
+    def __init__(self, path=CONFIG["memory_file"]):
+        self.path = path
+        self.patterns_path = CONFIG["patterns_file"]
+        self.data = self._empty()
+        self.patterns = self._empty_patterns()
+        self._load()
+        self._load_patterns()
+
+    def _empty(self):
+        return {
+            "version": "2.3",
+            "learned_pairs": {},
+            "feedback": {},
+            "profile": {"name": None, "facts": {}, "preferences": {}},
+            "associations": {},
+            "history": [],
+            "stats": {"turns": 0, "sessions": 0, "last_seen": 0.0,
+                      "trainings": 0},
+        }
+
+    def _empty_patterns(self):
+        return {
+            "version": "2.3",
+            "bigrams": {},
+            "trigrams": {},
+            "intent_frequency": {},
+            "topic_frequency": {},
+            "mood_patterns": {},
+            "hour_patterns": {},
+            "last_trained": None,
+        }
+
+    def _load(self):
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "rb") as f:
+                    loaded = pickle.load(f)
+                base = self._empty()
+                if loaded:
+                    base.update(loaded)
+                self.data = base
+                print("[MEM] تم تحميل الذاكرة: %s (%d أزواج)"
+                      % (self.path, len(self.data.get("learned_pairs", {}))))
+                return
+            except Exception as e:
+                print("[MEM] فشل تحميل الذاكرة (%s) — بدء جديد." % e)
+        self.data = self._empty()
+        self.save()
+        print("[MEM] ذاكرة جديدة: %s" % self.path)
+
+    def _load_patterns(self):
+        if os.path.exists(self.patterns_path):
+            try:
+                text = open(self.patterns_path, "r",
+                            encoding="utf-8").read().strip()
+                if not text:
+                    self._save_patterns()
+                    return
+                self.patterns = json.loads(text)
+                print("[PAT] تم تحميل الأنماط: %s" % self.patterns_path)
+                return
+            except Exception as e:
+                print("[PAT] فشل تحميل الأنماط (%s)." % e)
+        self._save_patterns()
+
+    def _save_patterns(self):
+        try:
+            atomic_write_text(
+                self.patterns_path,
+                json.dumps(self.patterns, ensure_ascii=False, indent=2))
+        except Exception as e:
+            print("[PAT] فشل حفظ الأنماط: %s" % e)
+
+    def save(self):
+        max_h = CONFIG["memory_max_history"]
+        if len(self.data["history"]) > max_h:
+            self.data["history"] = self.data["history"][-max_h:]
+        for w in list(self.data["associations"].keys()):
+            c = self.data["associations"][w]
+            if isinstance(c, dict) and len(c) > 60:
+                self.data["associations"][w] = dict(
+                    sorted(c.items(), key=lambda x: -x[1])[:60])
+        try:
+            atomic_write_bytes(
+                self.path,
+                pickle.dumps(self.data, protocol=pickle.HIGHEST_PROTOCOL))
+        except Exception as e:
+            print("[MEM] فشل الحفظ: %s" % e)
+
+    def add_learned_pair(self, q, a, score=1.0):
+        # إذا الجواب قصير جداً، حاول تحويله لجملة كاملة
+        try:
+            if a and len(a.strip()) < 30 and "ال" not in a[:3]:
+                q_norm = q.strip().rstrip("؟?.")
+                # إذا السؤال "ما هي عاصمة X" والجواب "Y"
+                import re as _re_lp
+                m = _re_lp.search(r"ما هي عاصمة\s+(.+)", q_norm)
+                if m:
+                    country = m.group(1).strip()
+                    a = "عاصمة %s هي %s." % (country, a.strip().rstrip("."))
+                else:
+                    m2 = _re_lp.search(r"ما هو\s+(.+)", q_norm)
+                    if m2 and len(a.strip()) < 20:
+                        a = "%s: %s." % (m2.group(1).strip(), a.strip().rstrip("."))
+        except Exception:
+            pass
+        k = hash_key(q)
+        lp = self.data["learned_pairs"]
+        if k in lp:
+            lp[k]["score"] = max(lp[k]["score"], score) + 0.05
+            lp[k]["count"] += 1
+            lp[k]["a"] = a
+        else:
+            lp[k] = {"q": q, "a": a, "score": score,
+                     "count": 1, "ts": time.time()}
+
+    def get_learned(self, q):
+        return self.data["learned_pairs"].get(hash_key(q))
+
+    def all_learned(self):
+        return list(self.data["learned_pairs"].values())
+
+    def forget(self, q):
+        k = hash_key(q)
+        if k in self.data["learned_pairs"]:
+            del self.data["learned_pairs"][k]
+            return True
+        return False
+
+    def add_feedback(self, reply, delta):
+        k = hash_key(reply)
+        fb = self.data["feedback"].setdefault(k, {"up": 0, "down": 0, "last": 0})
+        import time as _t
+        if delta > 0:
+            fb["up"] += 1
+        else:
+            fb["down"] += 1
+        fb["last"] = _t.time()
+
+    def get_feedback_score(self, reply):
+        """يرجع درجة الرد (-1 إلى +1)."""
+        k = hash_key(reply)
+        fb = self.data["feedback"].get(k, {})
+        up = fb.get("up", 0)
+        down = fb.get("down", 0)
+        total = up + down
+        if total == 0:
+            return 0.0
+        return (up - down) / total
+
+    def is_bad_reply(self, reply):
+        """هل الرد كان سيّئاً سابقاً؟"""
+        return self.get_feedback_score(reply) < -0.5
+
+    def set_name(self, name):
+        self.data["profile"]["name"] = name
+
+    def get_name(self):
+        return self.data["profile"].get("name")
+
+    def update_associations(self, tokens):
+        """ترابطات موزونة بالمسافة + اتجاه + حد أقصى."""
+        assoc = self.data["associations"]
+        n = len(tokens)
+        for i, w in enumerate(tokens):
+            bucket = assoc.setdefault(w, {})
+            # نافذة 5 كلمات، وزن يتناقص مع المسافة
+            for j in range(max(0, i - 5), min(n, i + 6)):
+                if j == i:
+                    continue
+                v = tokens[j]
+                # الوزن = 5 - المسافة (كل ما قرب، أثقل)
+                weight = 5 - abs(j - i)
+                bucket[v] = int(bucket.get(v, 0)) + weight
+            # حد أقصى: احتفظ بأقوى 30 ترابط لكل كلمة
+            if len(bucket) > 30:
+                top = sorted(bucket.items(), key=lambda x: -x[1])[:30]
+                assoc[w] = dict(top)
+
+    def get_related(self, word, limit=10):
+        """يرجع الكلمات المرتبطة بكلمة معينة."""
+        assoc = self.data["associations"].get(word, {})
+        if not assoc:
+            return []
+        items = sorted(assoc.items(), key=lambda x: -x[1])[:limit]
+        return [(k, v) for k, v in items]
+
+    def clean_associations(self, min_weight=3):
+        """ينظّف الترابطات الضعيفة (أقل من الحد)."""
+        assoc = self.data["associations"]
+        removed = 0
+        for w in list(assoc.keys()):
+            bucket = {k: v for k, v in assoc[w].items() if v >= min_weight}
+            if bucket:
+                assoc[w] = bucket
+            else:
+                del assoc[w]
+                removed += 1
+        return removed
+
+    def log_turn(self, role, text):
+        self.data["history"].append([role, text, time.time()])
+        if role == "user":
+            self.data["stats"]["turns"] = int(
+                self.data["stats"].get("turns", 0)) + 1
+
+    def new_session(self):
+        self.data["stats"]["sessions"] = int(
+            self.data["stats"].get("sessions", 0)) + 1
+        self.data["stats"]["last_seen"] = time.time()
+
+    def stats(self):
+        s = dict(self.data["stats"])
+        s["learned_pairs"] = len(self.data["learned_pairs"])
+        s["feedback_entries"] = len(self.data["feedback"])
+        s["associations"] = len(self.data["associations"])
+        s["history_len"] = len(self.data["history"])
+        s["bigrams"] = len(self.patterns.get("bigrams", {}))
+        s["trigrams"] = len(self.patterns.get("trigrams", {}))
+        return s
+
+    # ---------------- التدريب ----------------
+    def train_patterns(self, db=None):
+        history = self.data.get("history", [])
+        if not history:
+            return 0, "لا يوجد سجل حوار للتدريب عليه."
+
+        bigrams = self.patterns.setdefault("bigrams", {})
+        trigrams = self.patterns.setdefault("trigrams", {})
+        intents_freq = self.patterns.setdefault("intent_frequency", {})
+        topics_freq = self.patterns.setdefault("topic_frequency", {})
+        hour_pat = self.patterns.setdefault("hour_patterns", {})
+
+        pairs_analyzed = 0
+
+        for i in range(len(history) - 1):
+            role_a = history[i][0]
+            text_a = history[i][1]
+            ts_a = history[i][2]
+            role_b = history[i + 1][0]
+
+            if role_a == "user" and role_b == "ai":
+                pairs_analyzed += 1
+
+                toks = simple_tokens(text_a)
+                for j in range(len(toks) - 1):
+                    bg = toks[j] + " " + toks[j + 1]
+                    bigrams[bg] = int(bigrams.get(bg, 0)) + 1
+                for j in range(len(toks) - 2):
+                    tg = toks[j] + " " + toks[j + 1] + " " + toks[j + 2]
+                    trigrams[tg] = int(trigrams.get(tg, 0)) + 1
+
+                if db is not None:
+                    it = db.match_intent(text_a)
+                    if it:
+                        name = it.get("name", "?")
+                        intents_freq[name] = int(
+                            intents_freq.get(name, 0)) + 1
+                    tp = db.topic_for(text_a)
+                    if tp:
+                        for kw in tp.get("keywords", [])[:1]:
+                            topics_freq[kw] = int(
+                                topics_freq.get(kw, 0)) + 1
+
+                try:
+                    hour = datetime.fromtimestamp(ts_a).hour
+                    bucket = "%02d-%02d" % (hour, (hour + 2) % 24)
+                    hour_pat[bucket] = int(hour_pat.get(bucket, 0)) + 1
+                except Exception:
+                    pass
+
+        def top_n(d, n=200):
+            return dict(sorted(d.items(), key=lambda x: -x[1])[:n])
+
+        self.patterns["bigrams"] = top_n(bigrams)
+        self.patterns["trigrams"] = top_n(trigrams)
+        self.patterns["intent_frequency"] = top_n(intents_freq, 100)
+        self.patterns["topic_frequency"] = top_n(topics_freq, 100)
+        self.patterns["hour_patterns"] = top_n(hour_pat, 24)
+        self.patterns["last_trained"] = datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S")
+        self.data["stats"]["trainings"] = int(
+            self.data["stats"].get("trainings", 0)) + 1
+
+        self._save_patterns()
+        self.save()
+
+        return pairs_analyzed, (
+            "تم التدريب على %d زوج حوار. "
+            "الأنماط: bigrams=%d، trigrams=%d، نوايا=%d"
+            % (pairs_analyzed,
+               len(self.patterns["bigrams"]),
+               len(self.patterns["trigrams"]),
+               len(self.patterns["intent_frequency"])))
+
+    def show_memory(self, limit=30):
+        lines = ["🧠 ذاكرة البوت:"]
+        lp = self.data.get("learned_pairs", {})
+        if not lp:
+            lines.append("  (فارغة — علّمني بـ: تذكر: السؤال = الجواب)")
+        else:
+            lines.append("  • أزواج متعلَّمة: %d" % len(lp))
+            top = sorted(lp.values(),
+                         key=lambda x: -x.get("count", 0))[:limit]
+            for item in top:
+                q = item.get("q", "")[:40]
+                a = item.get("a", "")[:40]
+                c = item.get("count", 1)
+                lines.append("    - «%s» → «%s» (×%d)" % (q, a, c))
+
+        name = self.get_name()
+        if name:
+            lines.append("  • الاسم: %s" % name)
+
+        fb = self.data.get("feedback", {})
+        if fb:
+            up = sum(v.get("up", 0) for v in fb.values())
+            dn = sum(v.get("down", 0) for v in fb.values())
+            lines.append("  • التقييم: 👍 %d / 👎 %d" % (up, dn))
+
+        return "\n".join(lines)
+
+    def show_patterns(self, limit=20):
+        lines = ["📊 الأنماط المستخرجة:"]
+        lt = self.patterns.get("last_trained")
+        if lt:
+            lines.append("  • آخر تدريب: %s" % lt)
+        else:
+            lines.append("  • (لم يُدرَّب بعد — اكتب ~تدريب)")
+
+        bg = self.patterns.get("bigrams", {})
+        if bg:
+            top_bg = sorted(bg.items(), key=lambda x: -x[1])[:limit]
+            lines.append("  • أشهر bigrams:")
+            for k, v in top_bg:
+                lines.append("    - %s (×%d)" % (k, v))
+
+        if_ = self.patterns.get("intent_frequency", {})
+        if if_:
+            top_if = sorted(if_.items(), key=lambda x: -x[1])[:limit]
+            lines.append("  • النوايا الأكثر:")
+            for k, v in top_if:
+                lines.append("    - %s (×%d)" % (k, v))
+
+        tf = self.patterns.get("topic_frequency", {})
+        if tf:
+            top_tf = sorted(tf.items(), key=lambda x: -x[1])[:10]
+            lines.append("  • المواضيع الأكثر:")
+            for k, v in top_tf:
+                lines.append("    - %s (×%d)" % (k, v))
+
+        return "\n".join(lines)
+
+    def export_to_json(self, path=None):
+        path = path or CONFIG["export_file"]
+        try:
+            export = {
+                "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "memory": self.data,
+                "patterns": self.patterns,
+            }
+
+            def default(o):
+                if isinstance(o, (set, tuple)):
+                    return list(o)
+                return str(o)
+
+            atomic_write_text(
+                path,
+                json.dumps(export, ensure_ascii=False, indent=2,
+                           default=default))
+            return path
+        except Exception as e:
+            print("[EXPORT] فشل: %s" % e)
+            return None
+
+
+# =============================================================================
+# 4) Retriever
+# =============================================================================
+class Retriever(object):
+    def __init__(self, db, mem):
+        self.db, self.mem = db, mem
+
+    def search(self, query, topk=3):
+        qt = simple_tokens(query)
+        if not qt:
+            return []
+        results = []
+        for lp in self.mem.all_learned():
+            s = jaccard(qt, simple_tokens(lp["q"]))
+            if s > 0.0:
+                s *= (1.0 + 0.05 * min(lp.get("count", 1), 10))
+                results.append((s, "learned", lp["q"], lp["a"]))
+        for e in self.db.faq_entries():
+            if not isinstance(e, dict):
+                continue
+            q = e.get("q", "")
+            a = e.get("a", "")
+            if not q or not a:
+                continue
+            s = jaccard(qt, simple_tokens(q))
+            if s > 0.0:
+                results.append((s, "faq", q, a))
+        results.sort(key=lambda x: -x[0])
+        seen, out = set(), []
+        for s, src, q, a in results:
+            if a in seen:
+                continue
+            seen.add(a)
+            out.append((s, src, q, a))
+            if len(out) >= topk:
+                break
+        return out
+
+    def best(self, query):
+        # 1) كشف الأسئلة النحوية/الصرفية — مسار خاص
+        import re as _re_nahw
+        NAHW_PATTERNS = (
+            "ما اعراب", "ما هو اعراب", "ما هي اعراب", "اعرب", "أعرب",
+            "صغ من الفعل", "صرّف", "صرف", "استخرج",
+            "ما هو نوع", "ما هو اسم الفاعل", "ما هو اسم المفعول",
+            "ما هو المصدر", "ما هو المضارع", "ما هو الماضي",
+            "حدد نوع", "ما معنى كلمة", "ما معنى كلمه",
+        )
+        query_norm = query.strip()
+        # طبّع للتحقق
+        from arabic_utils import normalize_arabic as _norm_nahw
+        query_n = _norm_nahw(query_norm)
+        is_nahw = any(p in query_n for p in (_norm_nahw(p) for p in NAHW_PATTERNS))
+
+        if is_nahw:
+            # ابحث في عناصر CIDAR تحديداً
+            r = self.search_nahw(query, topk=3)
+            if r and r[0][0] >= 0.22:
+                if DEBUG:
+                    print("[NAHW] %.3f | %s" % (r[0][0], r[0][2][:60]))
+                return r[0]
+            return None
+
+        r = self.search(query, topk=1)
+        if not r:
+            return None
+        score, src, q, a = r[0]
+        # عتبة ديناميكية حسب نوع السؤال
+        qt = simple_tokens(query)
+        n = len(qt)
+        base = CONFIG["retrieval_threshold"]
+        # كشف المسألة الرياضية (أرقام + كلمة كم)
+        import re as _re_b
+        has_number = bool(_re_b.search(r"\d{2,}", query))
+        has_kam = any(k in query for k in ("كم ", "كم؟", "كم.", "كم كسبت",
+                                            "كم عدد", "كم باع", "كم بقي",
+                                            "كم يبلغ", "كم تبقى"))
+        is_math_problem = has_number and has_kam and n >= 5
+        if is_math_problem:
+            threshold = 0.42
+        elif n <= 2:
+            threshold = max(base, 0.60)
+        elif n <= 3:
+            threshold = max(base, 0.55)
+        elif n <= 5:
+            threshold = max(base, 0.50)
+        else:
+            threshold = max(base, 0.48)
+        if score >= threshold:
+            return r[0]
+        return None
+
+    def search_nahw(self, query, topk=3):
+        """بحث مخصص في عناصر CIDAR النحوية."""
+        qt = simple_tokens(query)
+        if not qt:
+            return []
+        results = []
+        for e in self.db.faq_entries():
+            if not isinstance(e, dict):
+                continue
+            tags = e.get("tags", [])
+            if "cidar" not in tags:
+                continue
+            q = e.get("q", "")
+            a = e.get("a", "")
+            if not q or not a:
+                continue
+            s = jaccard(qt, simple_tokens(q))
+            if s > 0.0:
+                results.append((s, "cidar", q, a))
+        results.sort(key=lambda x: -x[0])
+        seen, out = set(), []
+        for s, src, q, a in results:
+            if a in seen:
+                continue
+            seen.add(a)
+            out.append((s, src, q, a))
+            if len(out) >= topk:
+                break
+        return out
+
+
+# =============================================================================
+# 5) DialogueManager
+# =============================================================================
+SHORTCUT_PREFIX = "~"
+
+
+def _split_input(text):
+    """يقسم المدخل متعدد الأسطر إلى أسئلة منفصلة."""
+    if not text:
+        return []
+    # افصل على السطور
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    if len(lines) <= 1:
+        return [text.strip()]
+    # تحقق: هل كل سطر يبدو سؤالًا مستقلًا؟
+    out = []
+    for ln in lines:
+        if len(ln) >= 2:
+            out.append(ln)
+    return out if out else [text.strip()]
+
+
+class DialogueManager(object):
+    def __init__(self, db, mem, retriever=None):
+        self.db, self.mem = db, mem
+        self.retriever = retriever or Retriever(db, mem)
+        self.turn_buffer = []
+        # تتبع السياق
+        self.tracker = get_tracker() if get_tracker else None
+        # محرك التفكير العميق
+        self.engine = None
+        if get_engine is not None:
+            try:
+                self.engine = get_engine(db, mem, self.retriever)
+            except Exception as e:
+                print("[REASONING] فشل التهيئة: %s" % e)
+
+        # محركات متقدمة
+        self.math_engine = MathEngine() if MathEngine else None
+        # إدراك v2
+        self.cog_v2 = None
+        if get_cognition_v2 is not None:
+            try:
+                self.cog_v2 = get_cognition_v2(db)
+            except Exception as _e:
+                print("[COG2] فشل: %s" % _e)
+        self.tools = PracticalTools() if PracticalTools else None
+        self.summarizer = SmartSummarizer() if SmartSummarizer else None
+        self.kg = None
+        if get_knowledge_graph is not None:
+            try:
+                self.kg = get_knowledge_graph()
+            except Exception as _e:
+                print("[KG] فشل: %s" % _e)
+
+        self.root_index = None
+        if RootIndex is not None:
+            try:
+                self.root_index = RootIndex(db=db)
+            except Exception as _e:
+                print("[ROOT] فشل: %s" % _e)
+        self.formatter = Formatter() if Formatter else None
+        self.reasoner = None
+        if DeepReasoner and self.engine:
+            try:
+                self.reasoner = DeepReasoner(db, self.engine.index)
+            except Exception as e:
+                print("[DEEP] فشل: %s" % e)
+
+    def _cmd_summary(self, body):
+        """~ملخص"""
+        if not self.summarizer:
+            return "⚠️ محرك التلخيص غير متاح."
+        txt = body.replace("ملخص", "", 1).replace("sum", "", 1).replace("summary", "", 1).strip()
+        if not txt:
+            if self.turn_buffer:
+                _, last = self.turn_buffer[-1]
+                txt = last
+            else:
+                return "لا يوجد نص للتلخيص."
+        return self.summarizer.format_summary(txt, "ملخص")
+
+    def _cmd_units_help(self):
+        return (
+            "📐 الوحدات المدعومة:\n"
+            "  • الطول: كم، م، سم، مم، ميل، قدم، بوصة\n"
+            "  • الوزن: كغ، غ، طن، رطل، أونصة\n"
+            "  • الحجم: ل، مل، غالون\n"
+            "  • الزمن: ث، د، س، يوم، أسبوع، شهر، سنة\n"
+            "  • الحرارة: مئوي، فهرنهايت، كلفن\n\n"
+            "أمثلة:\n"
+            "  • 5 كم إلى متر\n"
+            "  • 100 مئوي إلى فهرنهايت\n"
+            "  • 10% من 250"
+        )
+
+    def _cmd_learning(self):
+        """~تعلم — إحصاءات التعلم."""
+        if not self.cog_v2:
+            return "⚠️ محرك التعلم غير متاح."
+        s = self.cog_v2.learning.stats()
+        lines = ["📚 إحصاءات التعلم:"]
+        lines.append("  • إجمالي الردود: %d" % s["total_turns"])
+        lines.append("  • أسئلة خاطئة سابقة: %d" % s["wrong_qs"])
+        lines.append("  • أسئلة صحيحة: %d" % s["right_qs"])
+        lines.append("  • تصحيحات: %d" % s["corrections"])
+        if s["top_intents"]:
+            lines.append("  • أكثر النوايا:")
+            for it, cnt in s["top_intents"]:
+                lines.append("    - %s: %d" % (it, cnt))
+        return "\n".join(lines)
+
+
+    def _cmd_gaps(self, body):
+        """~فجوات — يعرض الأسئلة بلا جواب."""
+        import json as _json, os as _os
+        gap_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "gaps.json")
+        if not _os.path.exists(gap_path):
+            return "لا توجد فجوات مسجلة حتى الآن."
+        try:
+            with open(gap_path, "r", encoding="utf-8") as _f:
+                gaps = _json.load(_f)
+        except Exception as _e:
+            return "فشل قراءة الفجوات: %s" % _e
+        if not gaps:
+            return "لا توجد فجوات مسجلة حتى الآن."
+        items = sorted(gaps.items(), key=lambda x: -x[1].get("count", 1))
+        out = ["الأسئلة بلا جواب (الأكثر تكراراً):", ""]
+        for q, info in items[:30]:
+            out.append("  - %s  [%d مرة]" % (q, info.get("count", 1)))
+        out.append("")
+        out.append("الإجمالي: %d سؤال مختلف" % len(gaps))
+        out.append("لحذف فجوة: ~حذففجوة النص الكامل")
+        return "\n".join(out)
+
+    def _cmd_delete_gap(self, q):
+        """~حذففجوة — يحذف سؤالاً من قائمة الفجوات."""
+        import json as _json, os as _os
+        gap_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "gaps.json")
+        if not _os.path.exists(gap_path):
+            return "لا يوجد ملف فجوات."
+        try:
+            with open(gap_path, "r", encoding="utf-8") as _f:
+                gaps = _json.load(_f)
+            key = None
+            for k in gaps:
+                if k == q or q in k:
+                    key = k
+                    break
+            if key:
+                del gaps[key]
+                with open(gap_path, "w", encoding="utf-8") as _f:
+                    _json.dump(gaps, _f, ensure_ascii=False, indent=2)
+                return "تم حذف: %s" % key
+            return "لم أجد هذه الفجوة."
+        except Exception as _e:
+            return "فشل: %s" % _e
+
+
+    def _cmd_learn_gap(self, body):
+        """~تعلمفجوة السؤال | الجواب — يحوّل فجوة إلى معرفة دائمة."""
+        import json as _json, os as _os
+        if "|" not in body:
+            return "الصيغة: ~تعلمفجوة السؤال | الجواب"
+        parts = body.split("|", 1)
+        q = parts[0].strip()
+        a = parts[1].strip()
+        if not q or not a:
+            return "السؤال والجواب مطلوبان."
+        # 1) أضف للذاكرة
+        try:
+            self.mem.add_learned_pair(q, a, score=1.0)
+            self.mem.save()
+        except Exception as _e:
+            return "فشل الحفظ في الذاكرة: %s" % _e
+        # 2) احذف من الفجوات
+        gap_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "gaps.json")
+        if _os.path.exists(gap_path):
+            try:
+                with open(gap_path, "r", encoding="utf-8") as _f:
+                    gaps = _json.load(_f)
+                # احذف أي فجوة تحتوي السؤال
+                removed = []
+                for k in list(gaps.keys()):
+                    if k == q or q in k or k in q:
+                        removed.append(k)
+                        del gaps[k]
+                if removed:
+                    with open(gap_path, "w", encoding="utf-8") as _f:
+                        _json.dump(gaps, _f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+        return "تم التعلم: %s" % q
+
+
+    def _cmd_cause(self, word):
+        """~سبب X — لماذا يحدث X؟"""
+        if not self.kg:
+            return "الشبكة المعرفية غير متاحة."
+        word = word.strip()
+        if not word:
+            return "الصيغة: ~سبب كلمة"
+        parents = self.kg.parents(word)
+        if not parents:
+            return "لا أعرف سببًا لـ: %s" % word
+        items = sorted(parents.items(), key=lambda x: -x[1])
+        lines = ["أسباب %s:" % word, ""]
+        for cause, conf in items:
+            lines.append("  • %s  (%d%%)" % (cause, int(conf * 100)))
+        return "\n".join(lines)
+
+    def _cmd_effect(self, word):
+        """~يؤدي X — ما نتائج X؟"""
+        if not self.kg:
+            return "الشبكة المعرفية غير متاحة."
+        word = word.strip()
+        if not word:
+            return "الصيغة: ~يؤدي كلمة"
+        results = self.kg.infer(word, max_depth=3, min_conf=0.5)
+        if not results:
+            return "لا أعرف نتائج لـ: %s" % word
+        # رتب حسب العمق ثم الثقة
+        results.sort(key=lambda c: (len(c), -c[-1][1]))
+        lines = ["نتائج %s:" % word, ""]
+        seen = set()
+        for chain in results[:10]:
+            chain_str = " → ".join([word] + [n for n, _ in chain])
+            if chain_str in seen:
+                continue
+            seen.add(chain_str)
+            last_conf = chain[-1][1]
+            lines.append("  • %s  (%d%%)" % (chain_str, int(last_conf * 100)))
+        return "\n".join(lines)
+
+    def _cmd_path(self, body):
+        """~مسار X إلى Y — المسار بين مفهومين."""
+        if not self.kg:
+            return "الشبكة المعرفية غير متاحة."
+        body = body.strip()
+        if " إلى " not in body:
+            return "الصيغة: ~مسار X إلى Y"
+        parts2 = body.split(" إلى ", 1)
+        src = parts2[0].strip()
+        dst = parts2[1].strip()
+        if not src or not dst:
+            return "الصيغة: ~مسار X إلى Y"
+        path = self.kg.path(src, dst, max_depth=6)
+        if not path:
+            return "لا يوجد مسار بين %s و %s" % (src, dst)
+        chain_str = " → ".join([n for n, _ in path])
+        # ثقة المسار = ضرب الثقات
+        conf = 1.0
+        for _, c in path:
+            conf *= c
+        return "المسار: %s\nالثقة الكلية: %d%%" % (chain_str, int(conf * 100))
+
+
+    def _cmd_ask_llm(self, question):
+        """~اسأل <سؤال> — يستخدم Qwen + RAG للرد."""
+        if not question:
+            return "الصيغة: ~اسأل سؤالك"
+        if not is_server_up or not is_server_up():
+            return "النموذج الذكي مش شغال. شغّل: ~/llama.cpp/build/bin/llama-server -m ~/models/qwen3-4b-islamic-q4.gguf -c 1024 -t 3 --port 8080"
+        # 1) اجمع معلومات من قاعدة البيانات
+        items = []
+        try:
+            best = self.retriever.best(question)
+            if best:
+                _, _, q, a = best
+                items.append({"q": q, "a": a})
+        except Exception:
+            pass
+        # جرّب أسئلة مشابهة إضافية
+        try:
+            if hasattr(self.retriever, "search"):
+                results = self.retriever.search(question, limit=3)
+                for r in results:
+                    q = r.get("q", "") if isinstance(r, dict) else ""
+                    a = r.get("a", "") if isinstance(r, dict) else ""
+                    if a and not any(it.get("a") == a for it in items):
+                        items.append({"q": q, "a": a})
+        except Exception:
+            pass
+
+        # 2) استخدم RAG إذا في معلومات
+        if items and rag_answer:
+            reply = rag_answer(question, items[:3], max_tokens=250)
+            if reply:
+                return reply
+        # 3) احتياطي: اسأل النموذج مباشرة
+        if llm_ask:
+            reply = llm_ask(
+                system="أنت مساعد عربي فصيح. أجب بإيجاز ووضوح.",
+                user=question,
+                max_tokens=250,
+            )
+            return reply or "لم أستطع الإجابة."
+        return "النموذج غير متاح."
+
+    def _cmd_server_status(self):
+        """~حالة — حالة النموذج الذكي."""
+        if not is_server_up:
+            return "محرك LLM غير مثبت."
+        if is_server_up():
+            return "النموذج الذكي شغال على http://127.0.0.1:8080"
+        return "النموذج الذكي متوقف. شغّلو من Termux."
+
+    def _help_text(self):
+        return """
+╔══════════════════════════════════════════════════════════════════════════╗
+║                    🤖 MiniChat-AI v2.3 — دليل شامل                       ║
+╚══════════════════════════════════════════════════════════════════════════╝
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 📁 1) الملفات
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  • main.py                   : الكود التنفيذي
+  • minichat_db.json          : قاعدة المعرفة
+  • minichat_memory.pkl       : ذاكرة التعلم (تلقائي)
+  • minichat_patterns.json    : الأنماط المستخرجة
+  • minichat_export.json      : تصدير اختياري
+  • add_knowledge.py          : إضافة معرفة من ويكيبيديا
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ ⚡ 2) الرموز السريعة (ابدأ بـ ~)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ~تدريب         : تحليل سجل الحوار واستخراج أنماط
+  ~تدريب 5       : نفس الأمر، 5 مرات
+  ~ذاكرة         : عرض ما تعلّمه البوت
+  ~مذاكرة        : مراجعة شاملة = الذاكرة + الأنماط
+  ~إحصاء         : إحصائيات رقمية كاملة
+  ~عرض           : عرض محتوى الملفات
+  ~تصدير         : حفظ الذاكرة في minichat_export.json
+  ~حفظ           : حفظ فوري
+  ~تصفير         : مسح الذاكرة والأنماط
+  ~مساعدة        : عرض هذا الدليل
+  ~خروج          : إنهاء الجلسة
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 💬 3) الأوامر العادية (بدون ~)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  تذكر: السؤال = الجواب    : علّم البوت معلومة
+  انس: السؤال               : احذف معلومة
+  اسمي أحمد                 : عرّفني باسمك
+  +  /  -                   : قيّم آخر رد
+  احصائيات                  : عرض الإحصائيات
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 🧠 4) كيف يعمل البوت
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. تطبيع النص         : توحيد الهمزات
+  2. فحص السلامة        : رفض المحتوى الضار
+  3. الرموز السريعة     : لو بدأت بـ ~
+  4. الأوامر العادية    : تذكر/انس/اسمي/تقييم
+  5. الرياضيات          : 3+4 → 7
+  6. الذاكرة المباشرة   : هل تعلمت السؤال؟
+  7. الملف الشخصي       : ما اسمي؟
+  8. النوايا (regex)    : تحية، شكر، وداع
+  9. الاسترجاع الدلالي  : مطابقة مع FAQ (بعد إزالة كلمات الوقف)
+ 10. المواضيع العامة    : نصائح
+ 11. Fallback           : رد محايد
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 📊 5) ما هو "التدريب"؟
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  التدريب = استخراج أنماط إحصائية من سجل الحوار.
+
+  يفحص:
+    • Bigrams      : ثنائيات الكلمات
+    • Trigrams     : ثلاثيات الكلمات
+    • نوايا        : النوايا الأكثر
+    • مواضيع       : المواضيع الأكثر
+    • ساعات        : أوقات النشاط
+
+  النتيجة: تُخزّن في minichat_patterns.json
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 💡 6) أمثلة عملية
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ▶ تعريف معلومة
+     تذكر: عاصمة المغرب = الرباط
+     تذكر: كلمة السر = صقر
+
+  ▶ الاسم
+     اسمي أحمد
+     ما اسمي؟
+
+  ▶ التدريب
+     ~تدريب
+
+  ▶ المراجعة الشاملة
+     ~مذاكرة
+
+  ▶ التصدير
+     ~تصدير
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 🔍 7) فهرس سريع
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  سؤال                          | الأمر
+  ------------------------------|------------------
+  كيف أدرّب البوت؟               | ~تدريب
+  ماذا تعلّم البوت؟              | ~ذاكرة
+  أريد مراجعة شاملة              | ~مذاكرة
+  كم عدد الردود والأزواج؟        | ~إحصاء
+  أريد نسخة احتياطية             | ~تصدير
+  أريد حفظ فوري                  | ~حفظ
+  أريد البدء من جديد             | ~تصفير
+  أريد إنهاء الجلسة              | ~خروج
+  أريد تعليم معلومة              | تذكر: س = ج
+  أريد حذف معلومة                | انس: س
+  أريد تعريف اسمي                | اسمي [الاسم]
+  أريد تقييم رد                  | +  أو  -
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ ✅ جاهز! اكتب أي شي وابدأ المحادثة.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
+    def _shortcut(self, text):
+        raw = text.strip()
+        # دعم كل التيلدات المتشابهة
+        TILDES = ("~", "\u02dc", "\uff5e", "\u301c", "\u2053", "\u223c")
+        # البحث عن أول تيلد في النص
+        idx = -1
+        for tld in TILDES:
+            i = raw.find(tld)
+            if i != -1 and (idx == -1 or i < idx):
+                idx = i
+        if idx == -1:
+            return False, None
+        # استخدام ما بعد التيلد
+        raw = raw[idx:]
+
+        body = raw[len(SHORTCUT_PREFIX):].strip()
+        cmd = normalize(body)
+        parts = cmd.split()
+        head = parts[0] if parts else ""
+
+        if head in ("مساعدة", "help", "؟", "?", ""):
+            return True, self._help_text()
+
+        if head in ("تدريب", "train"):
+            n = 1
+            if len(parts) > 1:
+                try:
+                    n = max(1, int(parts[1]))
+                except ValueError:
+                    n = 1
+            total = 0
+            last_msg = ""
+            for _ in range(n):
+                count, msg = self.mem.train_patterns(self.db)
+                total += count
+                last_msg = msg
+            return True, ("🎓 %s\n(تكرار: %d مرة، إجمالي الأزواج: %d)"
+                          % (last_msg, n, total))
+
+        if head in ("ذاكرة", "memory"):
+            return True, self.mem.show_memory()
+
+        if head in ("مذاكرة", "مراجعة", "review"):
+            return True, (self.mem.show_memory() + "\n\n" +
+                          self.mem.show_patterns())
+
+        if head in ("إحصاء", "احصائيات", "احصاء", "stats"):
+            s = self.mem.stats()
+            lines = ["📊 إحصائيات:"]
+            labels = {
+                "turns": "عدد الردود",
+                "sessions": "الجلسات",
+                "learned_pairs": "أزواج متعلَّمة",
+                "feedback_entries": "تقييمات",
+                "associations": "ترابطات",
+                "history_len": "سجل الحوار",
+                "bigrams": "bigrams",
+                "trigrams": "trigrams",
+                "trainings": "مرات التدريب",
+                "last_seen": "آخر جلسة",
+            }
+            for k, v in s.items():
+                name = labels.get(k, k)
+                lines.append("  • %s: %s" % (name, v))
+            return True, "\n".join(lines)
+
+        if head in ("تصدير", "export"):
+            p = self.mem.export_to_json()
+            if p:
+                return True, "💾 تم التصدير إلى: %s" % p
+            return True, "❌ فشل التصدير."
+
+        if head in ("حفظ", "save"):
+            self.mem.save()
+            self.mem._save_patterns()
+            return True, "💾 تم الحفظ."
+
+        if head in ("عرض", "show", "ملفات"):
+            return True, self._show_files()
+
+        if head in ("تصفير", "reset"):
+            self.mem.data = self.mem._empty()
+            self.mem.patterns = self.mem._empty_patterns()
+            self.mem.save()
+            self.mem._save_patterns()
+            return True, "🧹 تم تصفير الذاكرة والأنماط."
+
+        if head in ("خروج", "exit", "q"):
+            return True, "__EXIT__"
+
+        if head in ("ملخص", "sum", "summary"):
+            return True, self._cmd_summary(body)
+
+        if head in ("وحدات", "units"):
+            return True, self._cmd_units_help()
+
+        if head in ("تعلم", "learn", "learning"):
+            return True, self._cmd_learning()
+
+        if head in ("فجوات", "gaps", "فجوة"):
+            return True, self._cmd_gaps(body)
+
+        if head == "حذففجوة" and len(parts) > 1:
+            return True, self._cmd_delete_gap(parts[1])
+
+        if head in ("تعلمفجوة", "جوابفجوة"):
+            body2 = body[len(parts[0]):].strip() if body.startswith(parts[0]) else body
+            return True, self._cmd_learn_gap(body2)
+
+        if head in ("سبب", "لماذا"):
+            body2 = " ".join(body.split()[1:]) if len(body.split()) > 1 else ""
+            return True, self._cmd_cause(body2)
+
+        if head in ("يؤدي", "يودي", "نتيجة", "نتيجه", "ينتج"):
+            body2 = " ".join(body.split()[1:]) if len(body.split()) > 1 else ""
+            return True, self._cmd_effect(body2)
+
+        if head in ("مسار", "path"):
+            body2 = " ".join(body.split()[1:]) if len(body.split()) > 1 else ""
+            return True, self._cmd_path(body2)
+
+        if head in ("اسأل", "اسال", "ask"):
+            body2 = " ".join(body.split()[1:]) if len(body.split()) > 1 else ""
+            return True, self._cmd_ask_llm(body2)
+
+        if head in ("حالة", "server", "نموذج"):
+            return True, self._cmd_server_status()
+
+        if head in ("تاريخ", "date", "اليوم"):
+            if self.tools:
+                return True, "📅 %s\n⏰ %s" % (self.tools.today(), self.tools.now())
+            return True, "⚠️ محرك الأدوات غير متاح"
+
+        if head in ("عائلة", "عايله", "عايلة", "عایله", "family", "جذر"):
+            word = " ".join(parts[1:]) if len(parts) > 1 else ""
+            if word and self.root_index:
+                fam = self.root_index.family(word, limit=15)
+                root = RootExtractor.extract(word) if RootExtractor else "?"
+                if fam:
+                    return True, "🌳 جذر «%s» = %s\nعائلته: %s" % (word, root, " • ".join(fam))
+                return True, "لم أجد كلمات أخرى بهذا الجذر."
+            return True, "الصيغة: ~عائلة كلمة"
+
+        return True, ("❓ رمز غير معروف: %s\nاكتب ~مساعدة للقائمة." % raw)
+
+    def _show_files(self):
+        lines = ["📂 محتوى الملفات:", ""]
+
+        pp = self.mem.patterns_path
+        lines.append("━" * 40)
+        lines.append("📄 %s" % pp)
+        lines.append("━" * 40)
+        if os.path.exists(pp):
+            try:
+                content = open(pp, "r", encoding="utf-8").read()
+                lines.append("الحجم: %d حرف" % len(content))
+                lines.append("")
+                if len(content) > 1500:
+                    lines.append(content[:1500])
+                    lines.append("... (مقتطع)")
+                else:
+                    lines.append(content)
+            except Exception as e:
+                lines.append("خطأ قراءة: %s" % e)
+        else:
+            lines.append("(غير موجود)")
+        lines.append("")
+
+        mp = self.mem.path
+        lines.append("━" * 40)
+        lines.append("📄 %s" % mp)
+        lines.append("━" * 40)
+        if os.path.exists(mp):
+            try:
+                size = os.path.getsize(mp)
+                lines.append("الحجم: %d بايت" % size)
+                lines.append("ملخص:")
+                lines.append("  • أزواج متعلَّمة: %d"
+                             % len(self.mem.data.get("learned_pairs", {})))
+                lines.append("  • ترابطات: %d"
+                             % len(self.mem.data.get("associations", {})))
+                lines.append("  • سجل الحوار: %d"
+                             % len(self.mem.data.get("history", [])))
+            except Exception as e:
+                lines.append("خطأ قراءة: %s" % e)
+        else:
+            lines.append("(غير موجود)")
+
+        lines.append("")
+        lines.append("━" * 40)
+        lines.append("📄 minichat_db.json")
+        lines.append("━" * 40)
+        dbf = CONFIG["db_file"]
+        if os.path.exists(dbf):
+            size = os.path.getsize(dbf)
+            lines.append("الحجم: %d بايت" % size)
+            try:
+                with open(dbf, "r", encoding="utf-8") as f:
+                    db_data = json.load(f)
+                lines.append("  • intents: %d"
+                             % len(db_data.get("intents", [])))
+                lines.append("  • faq: %d"
+                             % len(db_data.get("faq", [])))
+                lines.append("  • topics: %d"
+                             % len(db_data.get("topics", {})))
+            except Exception:
+                pass
+        else:
+            lines.append("(غير موجود)")
+
+        return "\n".join(lines)
+
+    def _try_command(self, text):
+        raw = text.strip()
+        t = normalize(raw)
+        cmds = self.db.data.get("commands", {})
+
+        for kw in cmds.get("remember", []):
+            kn = normalize(kw)
+            if t.startswith(kn):
+                raw_rest = raw[len(kw):].strip(" :،,")
+                if "=" in raw_rest or ":" in raw_rest:
+                    sep = "=" if "=" in raw_rest else ":"
+                    q, a = raw_rest.split(sep, 1)
+                    q, a = q.strip(), a.strip()
+                    if q and a:
+                        self.mem.add_learned_pair(q, a, score=2.0)
+                        self.mem.save()
+                        return "تم الحفظ: «%s» ← «%s»" % (q, a)
+                return "الصيغة: تذكر: السؤال = الجواب"
+
+        for kw in cmds.get("forget", []):
+            if t.startswith(normalize(kw)):
+                rest = raw[len(kw):].strip(" :،,")
+                if rest and self.mem.forget(rest):
+                    self.mem.save()
+                    return "تم الحذف: «%s»" % rest
+                return "لم أجد هذا العنصر."
+
+        for kw in cmds.get("name", []):
+            kn = normalize(kw)
+            if kn in t:
+                idx = t.find(kn) + len(kn)
+                name = raw[idx:].strip(" :،,")
+                if name and len(name) < 40:
+                    self.mem.set_name(name)
+                    self.mem.save()
+                    return "تشرفت بك يا %s! سأتذكر اسمك." % name
+
+        if any(normalize(k) == t for k in cmds.get("help", [])):
+            return self._help_text()
+
+        if any(normalize(k) == t for k in cmds.get("stats", [])):
+            s = self.mem.stats()
+            return ("📊 إحصائيات:\n"
+                    "  • ردود: %d | جلسات: %d\n"
+                    "  • أزواج متعلَّمة: %d\n"
+                    "  • ترابطات: %d | سجل: %d"
+                    % (s["turns"], s["sessions"], s["learned_pairs"],
+                       s["associations"], s["history_len"]))
+
+        if any(normalize(k) == t for k in cmds.get("reset", [])):
+            self.mem.data = self.mem._empty()
+            self.mem.save()
+            return "تم تصفير الذاكرة بالكامل."
+
+        if t in ("+", "-", "جيد", "سيء", "good", "bad"):
+            if self.turn_buffer:
+                last_q, last_reply = self.turn_buffer[-1]
+                delta = 1 if t in ("+", "جيد", "good") else -1
+                self.mem.add_feedback(last_reply, delta)
+                # سجّل في محرك التعلم
+                if self.cog_v2 is not None:
+                    try:
+                        if delta > 0:
+                            self.cog_v2.record(last_q, last_reply, positive=True)
+                        else:
+                            self.cog_v2.record(last_q, last_reply, positive=False)
+                    except Exception:
+                        pass
+                self.mem.save()
+                return ("تم التقييم، شكرًا!" if delta > 0
+                        else "آسف، سأحاول التحسن.")
+            return "لا يوجد رد سابق لأقيّمه."
+
+        return None
+
+    @staticmethod
+    def _math(text):
+        m = re.match(
+            r"^\s*(-?\d+(?:\.\d+)?)\s*([\+\-\*x×/])\s*(-?\d+(?:\.\d+)?)\s*$",
+            normalize(text))
+        if not m:
+            return None
+        try:
+            a = float(m.group(1))
+            op = m.group(2)
+            b = float(m.group(3))
+            if op == "+":
+                r = a + b
+            elif op == "-":
+                r = a - b
+            elif op in ("*", "x", "×"):
+                r = a * b
+            else:
+                if b == 0:
+                    return "لا يمكن القسمة على صفر."
+                r = a / b
+            if abs(r - round(r)) < 1e-9:
+                return "الناتج %d." % int(round(r))
+            return "الناتج %.4f." % r
+        except Exception:
+            return None
+
+    def _route_context(self, text, lang):
+        _original_text = text
+        _original_text = text
+        if self.tracker is not None and lang == "ar":
+            try:
+                resolved = self.tracker.resolve_pronoun(text)
+                if resolved:
+                    if resolved["action"] == "rewrite":
+                        # نستخدم السؤال المعاد بناؤه
+                        text = resolved["new_question"]
+                        if DEBUG:
+                            print("[CTX] %r → %r" % (_original_text, text))
+                    elif resolved["action"] == "continue":
+                        # المستخدم يريد تكملة — نستخدم آخر رد
+                        if self.turn_buffer:
+                            last_q, last_reply = self.turn_buffer[-1]
+                            # نكمل آخر رد + نضيف معلومات من Qwen
+                            if is_server_up and is_server_up() and llm_ask:
+                                print("[LLM] جاري التفكير...")
+                                cont_reply = llm_ask(
+                                    system="أنت مساعد عربي. أكمل الموضوع بإيجاز بناءً على السياق.",
+                                    user="الموضوع: %s\nالرد السابق: %s\n\nأكمل بمعلومات إضافية." % (
+                                        resolved.get("topic", ""), last_reply[:400]),
+                                    max_tokens=250,
+                                    temperature=0.5,
+                                )
+                                if cont_reply:
+                                    r = self._wrap_with_mood(cont_reply)
+                                    self._finalize(text, r, "ctx:continue")
+                                    return r
+                            # احتياطي: أرجع نفس الرد
+                            r = "آخر جواب كان: %s" % last_reply[:300]
+                            self._finalize(text, r, "ctx:continue:fallback")
+                            return r
+            except Exception as _e:
+                if DEBUG:
+                    print("[CTX] فشل: %s" % _e)
+        return None
+
+    def respond(self, text, allow_shortcut=True):
+        text = (text or "").strip()
+        if not text:
+            return "…"
+        lang = "ar" if is_arabic(text) else "en"
+
+        # [0] سياق
+        _ctx = self._route_context(text, lang)
+        if _ctx is not None:
+            return _ctx
+
+        # اكشف المزاج (يُستخدم لاحقاً في التنسيق)
+        self._current_mood = None
+        self._mood_conf = 0.0
+        if detect_mood is not None and lang == "ar":
+            try:
+                m, c, _ = detect_mood(text)
+                if m and c >= 0.5:
+                    self._current_mood = m
+                    self._mood_conf = c
+            except Exception:
+                pass
+
+        # 0.a) فلترة المدخل الغير مفيد
+        if _is_garbage(text):
+            r = "لم أفهم ما تقصد. جرّب صيغة أخرى؟"
+            self._finalize(text, r, "garbage")
+            return r
+
+        # 0.b) فلترة المواضيع الحساسة (دينية، سياسية عميقة)
+        if _is_sensitive(text):
+            self._finalize(text, SENSITIVE_REPLY, "sensitive")
+            return SENSITIVE_REPLY
+
+        if allow_shortcut:
+            handled, reply = self._shortcut(text)
+            if handled:
+                if reply == "__EXIT__":
+                    return "__EXIT__"
+                self.mem.log_turn("user", text)
+                self.mem.log_turn("ai", reply)
+                self.turn_buffer.append((text, reply))
+                return reply
+
+        if self.db.is_unsafe(text):
+            r = self.db.safe_reply()
+            self._finalize(text, r, "safety")
+            return r
+
+        cmd = self._try_command(text)
+        if cmd is not None:
+            self._finalize(text, cmd, "command")
+            return cmd
+
+        # 3.b) أدوات عملية (وحدات، تواريخ، نسب)
+        if self.tools:
+            try:
+                conv = self.tools.parse_conversion(text)
+                if conv:
+                    if conv["kind"] == "unit":
+                        import re as _re2
+                        m = _re2.search(r"(\d+(?:\.\d+)?)", text)
+                        val_orig = m.group(1) if m else "?"
+                        r = "🔄 %s %s = %s %s" % (
+                            val_orig, conv.get("from", ""),
+                            conv.get("value", "?"), conv.get("to", ""))
+                        self._finalize(text, r, "unit")
+                        return r
+                    elif conv["kind"] == "temp":
+                        r = "🌡️ %.4g %s" % (conv.get("value", 0), conv.get("unit", ""))
+                        self._finalize(text, r, "temp")
+                        return r
+
+                pct = self.tools.parse_percent(text)
+                if pct:
+                    r = "📊 النتيجة: %.4g" % pct["value"]
+                    self._finalize(text, r, "percent")
+                    return r
+
+                t_norm = normalize(text)
+                if any(k in t_norm for k in ("التاريخ اليوم", "ما هو التاريخ", "تاريخ اليوم")):
+                    r = "📅 اليوم: %s" % self.tools.today()
+                    self._finalize(text, r, "date")
+                    return r
+                # كشف سؤال الوقت — بشرط ألا يكون سياقاً رياضياً
+                TIME_PHRASES = ("كم الساعة", "الساعة كم", "كم الوقت", "الوقت الان",
+                                "الوقت الآن", "شو الساعة", "شو الوقت")
+                is_time_q = any(p in t_norm for p in TIME_PHRASES)
+                # "الساعة" لوحدها: فقط إذا السؤال قصير وما فيه أرقام كبيرة
+                if not is_time_q and "الساعة" in t_norm:
+                    words_count = len(text.split())
+                    has_big_num = bool(_re_g.search(r"\d{2,}", text))
+                    has_math_ctx = any(k in t_norm for k in (
+                        "عملت", "كسبت", "باع", "اشترى", "دقيقة", "دقائق",
+                        "ساعات", "سعر", "تكلفة", "ربح", "خسر", "معدل",
+                        "دولار", "ليرة", "يورو", "درهم", "دينار", "ريال"))
+                    if words_count <= 6 and not has_big_num and not has_math_ctx:
+                        is_time_q = True
+                if is_time_q:
+                    r = "⏰ الآن: %s" % self.tools.now()
+                    self._finalize(text, r, "time")
+                    return r
+
+                import re as _re3
+                m_bill = _re3.search(
+                    r"(?:قسم|قسّم|اقسم)\s+(\d+(?:\.\d+)?)\s+على\s+(\d+)(?:\s+بقشيش\s+(\d+))?",
+                    text)
+                if m_bill:
+                    amt = m_bill.group(1); ppl = m_bill.group(2)
+                    tip = m_bill.group(3) or 0
+                    res = self.tools.split_bill(amt, ppl, tip)
+                    if res:
+                        r = "💰 الإجمالي: %s\n• للشخص: %s\n• البقشيش: %s" % (
+                            res["total"], res["per_person"], res["tip"])
+                        self._finalize(text, r, "bill")
+                        return r
+            except Exception as _e:
+                if DEBUG:
+                    print("[TOOLS] %s" % _e)
+
+        # 4.a) محرك الرياضيات المتقدم
+        if self.math_engine:
+            try:
+                # معادلة: 2x + 5 = 15
+                eq_match = _re_search_eq(text)
+                if eq_match:
+                    sol = self.math_engine.solve_linear(eq_match)
+                    if sol:
+                        r = "🧮 الحل: %s = %s" % (sol["var"], sol["value"])
+                        self._finalize(text, r, "math_eq")
+                        return r
+                # تعبير رياضي: 3+5*2
+                expr_match = _re_search_expr(text)
+                if expr_match:
+                    val = self.math_engine.evaluate(expr_match)
+                    if val is not None:
+                        r = "🧮 الناتج: %s" % val
+                        self._finalize(text, r, "math_expr")
+                        return r
+            except Exception as _e:
+                if DEBUG:
+                    print("[MATH] %s" % _e)
+
+        m = self._math(text)
+        if m is not None:
+            self._finalize(text, m, "math")
+            return m
+
+        lp = self.mem.get_learned(text)
+        if lp is not None:
+            r = lp["a"]
+            self._finalize(text, r, "memory")
+            return r
+
+        t = normalize(text)
+        if any(k in t for k in ("ما اسمي", "اسمي", "who am i", "my name")):
+            name = self.mem.get_name()
+            if name:
+                r = "اسمك %s، ولم أنسَه." % name
+                self._finalize(text, r, "profile")
+                return r
+
+        intent = self.db.match_intent(text)
+        if intent is not None:
+            responses = intent.get("responses", [])
+            if responses:
+                r = random.choice(responses)
+                nm = self.mem.get_name()
+                if nm and lang == "ar" and random.random() < 0.2:
+                    r = "%s، %s" % (nm, r)
+                self._finalize(text, r,
+                               "intent:" + intent.get("name", "?"))
+                return r
+
+        # 6.a) محرك المقارنة (قبل كل شيء)
+        # ملاحظة: db.cognition لم يكن يُستخدم هنا إلا كحارس.
+        # نستخدم self.engine لتفادي بناء Cognition بلا داعٍ.
+        if self.engine is not None:
+            try:
+                _txt = text.strip()
+                import re as _re
+                if "الفرق" in _txt or "قارن" in _txt or "الاختلاف" in _txt:
+                    # أنماط متعددة للمقارنة
+                    m = _re.search(r"(?:الفرق|قارن|الاختلاف)\s+(?:بين)?\s+(.+?)\s+(?:و|و\s|أو)\s*(.+)", _txt)
+                    if not m:
+                        m = _re.search(r"بين\s+(.+?)\s+(?:و|أو)\s*(.+)", _txt)
+                    if not m:
+                        m = _re.search(r"بين\s+(\S+?)\s*و\s*(\S+)", _txt)
+                    if not m:
+                        # محاولة أخيرة: ابحث عن "و" في منتصف الكلمات
+                        words = _txt.replace("الفرق","").replace("بين","").strip(" ؟?،.").split()
+                        # ابحث عن "و" كبداية كلمة
+                        for i, w in enumerate(words):
+                            if i > 0 and w.startswith("و") and len(w) > 1:
+                                e1 = " ".join(words[:i]).strip()
+                                e2 = " ".join(words[i:]).strip()
+                                if e1 and e2:
+                                    m = type("M", (), {"group": lambda self, n: [None, e1, e2][n]})()
+                                    break
+                    if m:
+                        # إصلاح: strip آمن (لا يحذف أحرف الكلمات)
+                        e1 = m.group(1).strip(" ؟?،.")
+                        e2 = m.group(2).strip(" ؟?،.")
+                        if DEBUG:
+                            print("[COMPARE] e1=%r e2=%r" % (e1, e2))
+                        # تصحيح تلقائي للكلمات الناقصة
+                        try:
+                            from fuzzy_matcher import correct_word
+                            vocab = None
+                            if self.engine and hasattr(self.engine.index, 'by_canon'):
+                                vocab = list(self.engine.index.by_canon.keys())[:15000]
+                            if vocab:
+                                e1_fixed = correct_word(e1, vocab, max_dist=2)
+                                e2_fixed = correct_word(e2, vocab, max_dist=2)
+                                if e1_fixed and e1_fixed != e1:
+                                    if DEBUG:
+                                        print("[COMPARE] e1 مصحّح: %r → %r" % (e1, e1_fixed))
+                                    e1 = e1_fixed
+                                if e2_fixed and e2_fixed != e2:
+                                    if DEBUG:
+                                        print("[COMPARE] e2 مصحّح: %r → %r" % (e2, e2_fixed))
+                                    e2 = e2_fixed
+                        except Exception as _ec:
+                            if DEBUG:
+                                print("[COMPARE] فشل التصحيح: %s" % _ec)
+                        item1 = self.engine.index.find(e1) if self.engine else None
+                        item2 = self.engine.index.find(e2) if self.engine else None
+                        if item1 or item2:
+                            if self.formatter:
+                                r = self.formatter.comparison(
+                                    e1, item1["a"] if item1 else "لا يوجد",
+                                    e2, item2["a"] if item2 else "لا يوجد"
+                                )
+                            else:
+                                parts = ["⚖️ مقارنة بين «%s» و «%s»:\n" % (e1, e2)]
+                                if item1:
+                                    parts.append("◾ %s:\n%s\n" % (e1, item1["a"][:400]))
+                                if item2:
+                                    parts.append("◾ %s:\n%s\n" % (e2, item2["a"][:400]))
+                                r = "\n".join(parts)
+                            self._finalize(text, r, "compare")
+                            return r
+            except Exception as _e:
+                if DEBUG:
+                    print("[COMPARE] %s" % _e)
+
+        # 6.b3) استخدام الإدراك v2
+        if self.cog_v2 is not None:
+            try:
+                # 1) تحليل السؤال
+                _analysis = self.cog_v2.analyze(text)
+                _qtype = _analysis["question_type"]
+                _topic = _analysis["topic"]
+                _contexts = _analysis["contexts"]
+
+                if DEBUG:
+                    print("[COG2] نوع: %s، موضوع: %s، سياق: %s"
+                          % (_qtype, _topic, _contexts))
+
+                # 2) إجابة "لماذا" من قاعدة الاستدلال
+                if _qtype == "why":
+                    _why_answer = self.cog_v2.answer_why(text)
+                    if _why_answer:
+                        self._finalize(text, _why_answer, "cog2:why")
+                        return _why_answer
+
+                # 3) كشف الالتباس + الفصل
+                _disamb = self.cog_v2.disambiguate(text)
+                _preferred = None
+                for _amb in _disamb["ambiguous_words"]:
+                    if _amb["preferred_context"]:
+                        _preferred = _amb["preferred_context"]
+                        break
+
+                # 4) إذا كان هناك سياق مُفضّل، ابحث بذكاء
+                if _preferred and self.engine:
+                    # قائمة كلمات دالة على السياق
+                    CONTEXT_KEYWORDS = {
+                        "health": ["مرض", "علاج", "أعراض", "خلايا", "ورم", "انتشار"],
+                        "animal": ["حيوان", "قشري", "محيطات", "أقدام", "مفصليات"],
+                        "science": ["كوكب", "نجم", "ضوء", "حرارة", "فيزياء", "طبقة"],
+                        "geo": ["مدينة", "دولة", "عاصمة", "نهر", "جبل", "بحيرة"],
+                        "people": ["ولد", "توفي", "عالم", "شاعر", "كاتب", "سياسي"],
+                    }
+                    _desired = CONTEXT_KEYWORDS.get(_preferred, [])
+
+                    # scoring: نتائج + عقوبات
+                    _candidates = []
+                    _all_ctx_kws = {}
+                    for _c, _kws in CONTEXT_KEYWORDS.items():
+                        _all_ctx_kws[_c] = _kws
+
+                    for _e in self.db.faq_entries():
+                        if not isinstance(_e, dict):
+                            continue
+                        _q = _e.get("q", "")
+                        if _topic not in normalize_arabic(_q):
+                            continue
+                        _a = _e.get("a", "")[:400]
+                        _a_norm = normalize_arabic(_a)
+                        # bonus من السياق المُفضّل
+                        _score = 0
+                        for _kw in _desired:
+                            if _kw in _a_norm:
+                                _score += 3
+                        # عقوبة من السياقات الأخرى
+                        for _ctx_other, _kws_other in _all_ctx_kws.items():
+                            if _ctx_other == _preferred:
+                                continue
+                            for _kw in _kws_other:
+                                if _kw in _a_norm:
+                                    _score -= 2
+                        if _score != 0:
+                            _candidates.append((_score, _e))
+
+                    if _candidates:
+                        _candidates.sort(key=lambda x: -x[0])
+                        _best = _candidates[0][1]
+                        if DEBUG:
+                            print("[COG2] اختيار سياق %s: %s (score %d)"
+                                  % (_preferred, _best.get("q", "")[:40],
+                                     _candidates[0][0]))
+                        # تحقق من التطابق
+                        if not self._verify_match(text, _best.get("a", ""), _best.get("q", "")):
+                            if DEBUG:
+                                print("[VERIFY] cog2:context فشل التحقق")
+                        else:
+                            if self.formatter:
+                                _r = self.formatter.definition(
+                                    _best.get("q", _topic)[:60], _best["a"])
+                            else:
+                                _r = _best["a"]
+                            self._finalize(text, _r, "cog2:context:" + _preferred)
+                            return _r
+
+                # 5) توسيع الاستعلام
+                _enriched = self.cog_v2.enrich_query(text)
+                if _enriched and self.engine and _topic:
+                    _item = self.engine.index.find(_topic)
+                    if _item and len(_item.get("a", "")) > 80:
+                        if self._verify_match(text, _item.get("a", ""), _item.get("q", "")):
+                            if self.formatter:
+                                _r = self.formatter.definition(
+                                    _item.get("q", _topic)[:60], _item["a"])
+                            else:
+                                _r = _item["a"]
+                            self._finalize(text, _r, "cog2:enriched")
+                            return _r
+            except Exception as _e:
+                if DEBUG:
+                    print("[COG2] خطأ: %s" % _e)
+
+        # 6.b2) الفحص النحوي/الصرفي (قبل engine.think)
+        import re as _re_nh
+        from arabic_utils import normalize_arabic as _norm_nh
+        _qn = _norm_nh(text)
+        _NAHW = ("صغ من الفعل", "صرف", "استخرج", "اعرب", "أعرب", "ما اعراب",
+                 "ما هو اعراب", "ما هي اعراب", "ما هو نوع", "ما هو اسم الفاعل",
+                 "ما هو اسم المفعول", "ما هو المصدر", "حدد نوع", "ما معنى كلمة")
+        _is_nahw = any(_norm_nh(p) in _qn for p in _NAHW)
+        _MORPH_HINT = ("اسم الفاعل", "اسم المفعول", "المصدر", "صغ من الفعل")
+        _is_morph = any(_norm_nh(p) in _qn for p in _MORPH_HINT)
+        if _is_nahw:
+            _nahw_found = False
+            # محاولة عبر خدمة المعجم العربي (مصدر الحقيقة للصرف)
+            if _is_morph:
+                try:
+                    from services.arabic_lexicon.service import ArabicLexiconService
+                    if not hasattr(self, "_lexicon_svc"):
+                        self._lexicon_svc = ArabicLexiconService()
+                    _lex_r = self._lexicon_svc.handle(text)
+                    if _lex_r and _lex_r.handled and _lex_r.answer:
+                        if DEBUG:
+                            print("[LEX] %s conf=%.2f src=%s" % (
+                                _lex_r.answer, _lex_r.confidence, _lex_r.source))
+                        _a = self._wrap_with_mood(_lex_r.answer)
+                        self._finalize(text, _a, _lex_r.source, score=_lex_r.confidence)
+                        return _a
+                    elif DEBUG:
+                        print("[LEX] لا نتيجة:", _lex_r.source if _lex_r else "None")
+                except Exception as _e:
+                    if DEBUG:
+                        print("[LEX] فشل: %s" % _e)
+
+            try:
+                _nr = self.retriever.search_nahw(text, topk=1)
+                if _nr and _nr[0][0] >= 0.22:
+                    _score, _src, _q, _a = _nr[0]
+                    # تحقق: هل الفعل/الكلمة المطلوبة موجودة في السؤال المرجّع؟
+                    _user_keys = set(simple_tokens(text))
+                    _matched_keys = set(simple_tokens(_q))
+                    _GENERIC_NH = {"صغ", "من", "الفعل", "فعل", "اسم", "الفاعل", "فاعل",
+                                    "المفعول", "مفعول", "المصدر", "مصدر", "اعراب", "كلمة",
+                                    "في", "جمله", "جملة", "ما", "هو", "هي",
+                                    "استخرج", "نوع", "حدد", "معنى", "وضح",
+                                    "اشرح", "اكمل", "أكمل", "الاجوف", "اجوف",
+                                    "الضمائر", "للضماير", "ضمير", "هما", "هم",
+                                    "هن"}
+                    _keys_user = _user_keys - _GENERIC_NH
+                    _keys_match = _matched_keys - _GENERIC_NH
+                    if _keys_user:
+                        _overlap = _keys_user & _keys_match
+                        _ratio = len(_overlap) / float(len(_keys_user))
+                        if _ratio < 0.7:
+                            if DEBUG:
+                                print("[NAHW] فشل التحقق: %.2f" % _ratio)
+                            _nr = None
+                    if _nr:
+                        if DEBUG:
+                            print("[NAHW] %.3f | %s" % (_score, _q[:60]))
+                        _a = self._wrap_with_mood(_a)
+                        self._finalize(text, _a, "nahw", score=_score)
+                        return _a
+            except Exception as _e:
+                if DEBUG:
+                    print("[NAHW] فشل: %s" % _e)
+
+            # لم نجد في CIDAR — توجه مباشرة لـ Qwen
+            # استثناء: أسئلة الصرف تتطلب محركًا متخصصًا، لا نخمّن بـ LLM
+            if _is_morph and DEBUG:
+                print("[NAHW] سؤال صرفي بلا جواب موثوق — لن نستخدم LLM")
+            if (not _is_morph) and is_server_up and is_server_up() and llm_ask:
+                try:
+                    print("[LLM] جاري التفكير (سؤال نحوي)...")
+                    _llm_reply = llm_ask(
+                        system="أنت خبير في اللغة العربية والنحو والصرف. أجب بإيجاز ودقة.",
+                        user=text,
+                        max_tokens=300,
+                        temperature=0.4,
+                    )
+                    if _llm_reply and len(_llm_reply) > 10:
+                        _llm_reply = self._wrap_with_mood(_llm_reply)
+                        self._finalize(text, _llm_reply, "nahw:llm")
+                        return _llm_reply
+                except Exception as _e:
+                    if DEBUG:
+                        print("[NAHW-LLM] فشل: %s" % _e)
+
+        if _is_nahw:
+            _r = "لم أجد جوابًا نحويًا موثوقًا لهذا السؤال."
+            self._finalize(text, _r, "nahw:unresolved")
+            return _r
+
+        # 6.c) محرك الاستدلال العربي
+        if self.engine is not None:
+            # جرّب أولاً النص كما هو
+            try:
+                answer, src_kind, conf, trace_steps = self.engine.think(text)
+                # إذا لم يجد، جرّب بعد التصحيح الإملائي
+                if (not answer or conf < 0.5) and correct_sentence and self.engine.index:
+                    try:
+                        # لا تصحح النصوص غير العربية القصيرة
+                        import re as _re_f
+                        arabic_chars = len(_re_f.findall(r"[\u0600-\u06FF]", text))
+                        if arabic_chars < 3:
+                            # نص غير عربي — لا fuzzy
+                            raise ValueError("non-arabic")
+                        vocab = list(self.engine.index.by_canon.keys())[:5000]
+                        corrected = correct_sentence(text, vocab, max_dist=2)
+                        if corrected != text and DEBUG:
+                            print("[FUZZY] %r → %r" % (text, corrected))
+                        if corrected != text:
+                            answer, src_kind, conf, trace_steps = self.engine.think(corrected)
+                            if answer and conf >= 0.5:
+                                src_kind = "fuzzy:" + src_kind
+                    except Exception as _e:
+                        if DEBUG:
+                            print("[FUZZY] %s" % _e)
+                if answer and conf >= 0.5:
+                    if DEBUG:
+                        print("[THINK] kind=%s conf=%.2f" % (src_kind, conf))
+                    if self._verify_match(text, answer):
+                        answer = self._wrap_with_mood(answer)
+                        self._finalize(text, answer, "reason:" + src_kind, score=conf)
+                        return answer
+                    elif DEBUG:
+                        print("[VERIFY] reason فشل التحقق")
+            except Exception as e:
+                if DEBUG:
+                    print("[THINK] خطأ: %s" % e)
+
+        # 6.d) البحث في الذاكرة بعد المحرك
+        lp = self.mem.get_learned(text)
+        if lp is None:
+            try:
+                from arabic_utils import canonical as _canon
+                _c = _canon(text)
+                for _k, _v in self.mem.data.get("learned_pairs", {}).items():
+                    if _canon(_v.get("q","")) == _c:
+                        lp = _v
+                        break
+            except Exception:
+                pass
+        if lp is not None:
+            self._finalize(text, lp["a"], "memory_exact")
+            return lp["a"]
+
+        best = self.retriever.best(text)
+        if best is not None:
+            score, src, q, a = best
+            # تحقق: هل هذا الرد كان سيّئاً سابقاً؟
+            try:
+                if self.mem.is_bad_reply(a):
+                    if DEBUG:
+                        print("[FEEDBACK] الرد سيّئ، نبحث عن بديل")
+                    # حاول Qwen بدل الرد السيئ
+                    if is_server_up and is_server_up() and llm_ask:
+                        print("[LLM] جاري التفكير (بديل لرد سيّئ)...")
+                        llm_reply = llm_ask(
+                            system="أنت مساعد عربي فصيح. أجب بإيجاز ووضوح.",
+                            user=text,
+                            max_tokens=250,
+                            temperature=0.5,
+                        )
+                        if llm_reply and len(llm_reply) > 10:
+                            llm_reply = self._wrap_with_mood(llm_reply)
+                            self._finalize(text, llm_reply, "llm:replacement")
+                            return llm_reply
+                    # إذا Qwen مش متاح، ارجع رد افتراضي
+                    r = random.choice(self.db.fallbacks(lang))
+                    self._finalize(text, r, "bad_reply_fallback")
+                    return r
+            except Exception as _e:
+                if DEBUG:
+                    print("[FEEDBACK] فشل: %s" % _e)
+            topic = self.db.topic_for(text)
+            if topic and random.random() < 0.3:
+                advice = topic.get("advice", [])
+                if advice:
+                    a = a + " " + random.choice(advice)
+            a = self._wrap_with_mood(a)
+            self._finalize(text, a, "retrieval:" + src, score=score)
+            return a
+
+        topic = self.db.topic_for(text)
+        if topic is not None:
+            advice = topic.get("advice", [])
+            if advice:
+                r = random.choice(advice)
+                self._finalize(text, r, "topic")
+                return r
+
+        # 6.e) محاولة أخيرة: عائلة الجذر (فقط إذا فشل كل شيء)
+        if self.root_index and self.engine:
+            try:
+                roots = self.root_index.roots_of(text)
+                for root in roots[:1]:
+                    family = self.root_index.words_with_root(root)[:5]
+                    for w in family:
+                        item = self.engine.index.find(w)
+                        if item and len(item.get("a", "")) > 100:
+                            # تحقق: هل الكلمة مشابهة فعلاً؟
+                            from arabic_utils import similarity_score
+                            sim = similarity_score(text, item.get("q", ""))
+                            if sim >= 0.5:
+                                if self.formatter:
+                                    r = self.formatter.definition(item.get("q", w)[:60], item["a"])
+                                else:
+                                    r = item["a"]
+                                self._finalize(text, r, "root_family:" + root)
+                                return r
+            except Exception as _e:
+                if DEBUG:
+                    print("[ROOT] %s" % _e)
+
+        # 6.f) محاولة أخيرة: Qwen + RAG (إذا السيرفر شغال)
+        if is_server_up and is_server_up():
+            try:
+                print("[LLM] جاري التفكير...")
+                # 1) اجمع معلومات من قاعدة البيانات
+                items = []
+                try:
+                    best = self.retriever.best(text)
+                    if best:
+                        _, _, q, a = best
+                        items.append({"q": q, "a": a})
+                except Exception:
+                    pass
+                # 2) RAG إذا في معلومات، وإلا Qwen مباشرة
+                llm_reply = None
+                if items and rag_answer:
+                    llm_reply = rag_answer(text, items[:3], max_tokens=250, temperature=0.4)
+                if not llm_reply and llm_ask:
+                    llm_reply = llm_ask(
+                        system="أنت مساعد عربي فصيح. أجب بإيجاز ووضوح.",
+                        user=text,
+                        max_tokens=250,
+                        temperature=0.5,
+                    )
+                # 3) تنقية الرد قبل الحفظ
+                if llm_reply:
+                    try:
+                        from llm_bridge import _dedup_repetition as _dedup1, _dedup_ngrams as _dedup2
+                        llm_reply = _dedup1(llm_reply)
+                        llm_reply = _dedup2(llm_reply)
+                    except Exception:
+                        pass
+                # 4) إذا نجح، احفظو وأرجعو
+                if llm_reply and len(llm_reply) > 10:
+                    # تحقق: هل الرد فيه تكرار مفرط؟
+                    bad_repeat = False
+                    try:
+                        # إذا نفس الجملة (30 حرف) تكررت 3+ مرات
+                        if len(llm_reply) > 100:
+                            chunk = llm_reply[:30]
+                            if chunk and llm_reply.count(chunk) >= 3:
+                                bad_repeat = True
+                    except Exception:
+                        pass
+                    if bad_repeat:
+                        if DEBUG:
+                            print("[LLM] رد به تكرار، لن يُحفظ")
+                        r = random.choice(self.db.fallbacks(lang))
+                        self._finalize(text, r, "llm:repetition")
+                        return r
+                    try:
+                        self.mem.add_learned_pair(text, llm_reply, score=0.9)
+                        self.mem.save()
+                    except Exception:
+                        pass
+                    llm_reply = self._wrap_with_mood(llm_reply)
+                    self._finalize(text, llm_reply, "llm:auto")
+                    return llm_reply
+            except Exception as _e:
+                if DEBUG:
+                    print("[LLM] فشل: %s" % _e)
+
+        # سجّل الفجوة (سؤال لم نجد له جواب)
+        self._log_gap(text)
+        r = random.choice(self.db.fallbacks(lang))
+        self._finalize(text, r, "fallback")
+        return r
+
+    def _wrap_with_mood(self, reply):
+        """يضيف لمسة عاطفية للرد إذا في مزاج قوي."""
+        if not self._current_mood:
+            return reply
+        if not get_opener or not get_closer:
+            return reply
+        opener = get_opener(self._current_mood)
+        closer = get_closer(self._current_mood)
+        parts = []
+        if opener:
+            parts.append(opener)
+        parts.append(reply)
+        if closer:
+            parts.append("")
+            parts.append(closer)
+        return "\n".join(parts)
+
+    def _log_gap(self, text):
+        """يسجّل سؤالًا لم نجد له جوابًا."""
+        import json as _json, os as _os, time as _time
+        gap_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "gaps.json")
+        try:
+            if _os.path.exists(gap_path):
+                with open(gap_path, "r", encoding="utf-8") as _f:
+                    gaps = _json.load(_f)
+            else:
+                gaps = {}
+            key = text.strip()
+            if not key:
+                return
+            if key in gaps:
+                gaps[key]["count"] = gaps[key].get("count", 1) + 1
+                gaps[key]["last"] = _time.time()
+            else:
+                gaps[key] = {"count": 1, "first": _time.time(), "last": _time.time()}
+            # احتفظ بأحدث 1000 فجوة (الأكثر تكرارًا أولاً)
+            if len(gaps) > 1000:
+                items = sorted(gaps.items(), key=lambda x: -x[1].get("count", 1))
+                gaps = dict(items[:1000])
+            with open(gap_path, "w", encoding="utf-8") as _f:
+                _json.dump(gaps, _f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _verify_match(self, query, answer, matched_q=None):
+        """يتحقق إن الكلمة الأساسية للسؤال موجودة في الجواب المرجّع."""
+        try:
+            qt = simple_tokens(query)
+            if not qt:
+                return True
+            # الكلمات الأساسية (بدون كلمات عامة)
+            GENERIC = {"سورة", "ايه", "ما", "هو", "هي", "فوائد", "فوايد",
+                       "معنى", "تعريف", "معلومات", "عباره", "عبارة", "شي",
+                       "اشياء", "انواع", "انواع", "قائمه", "قائمة", "كلمه"}
+            keys = [w for w in qt if w not in GENERIC and len(w) >= 3]
+            if not keys:
+                return True
+            # نص المقارنة: السؤال المرجّع + الجواب (أول 300 حرف)
+            haystack = ""
+            if matched_q:
+                haystack += normalize(matched_q) + " "
+            haystack += normalize(answer[:300])
+            # يجب أن يكون على الأقل نصف الكلمات الأساسية موجودة
+            hits = sum(1 for k in keys if k in haystack)
+            ratio = hits / float(len(keys))
+            return ratio >= 0.5
+        except Exception:
+            return True
+
+    def _finalize(self, user_text, reply, source, score=0.0):
+        self.mem.log_turn("user", user_text)
+        self.mem.log_turn("ai", reply)
+        self.mem.update_associations(simple_tokens(user_text))
+        # أضف للـ tracker
+        if self.tracker is not None:
+            try:
+                self.tracker.add_turn(user_text, reply)
+            except Exception:
+                pass
+        # لا تحفظ ردود retriever تلقائيًا (قد تكون خاطئة)
+        # فقط الذاكرة المُعلّمة يدويًا (تذكر:) أو المحرك الذكي تُحفظ
+        self.turn_buffer.append((user_text, reply))
+        if len(self.turn_buffer) > 8:
+            self.turn_buffer = self.turn_buffer[-8:]
+        self.mem.save()
+        trace("_finalize source=%s" % source)
+
+    def chat_loop(self):
+        self.mem.new_session()
+        self.mem.save()
+
+        print("\n" + "=" * 55)
+        print("  🤖 MiniChat-AI v2.3 — جاهز للمحادثة")
+        print("=" * 55)
+        print("\nاكتب رسالتك. الرموز: ~مساعدة، ~تدريب، ~ذاكرة، ~خروج\n")
+
+        while True:
+            try:
+                user = input("أنت > ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nإلى اللقاء!")
+                break
+            if not user:
+                continue
+            reply = self.respond(user)
+            if reply == "__EXIT__":
+                print("MiniChat > إلى اللقاء!")
+                break
+            print("MiniChat > %s" % _wrap_text(reply))
+            print()
+
+        self.mem.save()
+
+
+# =============================================================================
+# 6) main
+# =============================================================================
+def _clean_line(line):
+    s = line.strip()
+    if s.startswith("--ask"):
+        s = s[5:].strip()
+    if len(s) >= 2 and s[0] in ('"', "'") and s[-1] == s[0]:
+        s = s[1:-1]
+    s = s.replace('--ask "', "").replace("--ask '", "")
+    if s.endswith('"') or s.endswith("'"):
+        s = s[:-1]
+    return s.strip()
+
+
+def main():
+    global DEBUG
+
+    parser = argparse.ArgumentParser(description="MiniChat-AI v2.3")
+    parser.add_argument("--chat", action="store_true",
+                        help="محادثة تفاعلية")
+    parser.add_argument("--train", type=int, default=0,
+                        help="تدريب فوري N مرات")
+    parser.add_argument("--memory", action="store_true",
+                        help="عرض الذاكرة")
+    parser.add_argument("--patterns", action="store_true",
+                        help="عرض الأنماط")
+    parser.add_argument("--stats", action="store_true",
+                        help="إحصائيات")
+    parser.add_argument("--export", action="store_true",
+                        help="تصدير الذاكرة إلى JSON")
+    parser.add_argument("--fix-db", action="store_true",
+                        help="إصلاح قاعدة البيانات")
+    parser.add_argument("--ask", type=str, default="",
+                        help="سؤال واحد ثم خروج")
+    parser.add_argument("--demo", action="store_true",
+                        help="عرض تجريبي")
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
+
+    DEBUG = args.debug
+    set_seed(CONFIG["seed"])
+
+    if args.fix_db:
+        print("[FIX-DB] محاولة إصلاح %s..." % CONFIG["db_file"])
+        ensure_db_ready(CONFIG["db_file"])
+        try:
+            with open(CONFIG["db_file"], "r", encoding="utf-8") as f:
+                json.load(f)
+            print("[FIX-DB] ✅ الملف سليم الآن.")
+        except Exception as e:
+            print("[FIX-DB] ❌ ما زال فيه خلل: %s" % e)
+        return
+
+    print("[1/3] تهيئة قاعدة البيانات...")
+    db = StructuredDB(CONFIG["db_file"])
+    print("[2/3] تهيئة الذاكرة...")
+    mem = MemoryStore(CONFIG["memory_file"])
+    print("[3/3] تجهيز المحرك...")
+    retriever = Retriever(db, mem)
+    dm = DialogueManager(db, mem, retriever=retriever)
+    print("✅ جاهز.\n")
+
+    if args.stats:
+        s = mem.stats()
+        print("=== إحصائيات ===")
+        for k, v in s.items():
+            print("  %s: %s" % (k, v))
+        return
+
+    if args.memory:
+        print(mem.show_memory())
+        return
+
+    if args.patterns:
+        print(mem.show_patterns())
+        return
+
+    if args.export:
+        p = mem.export_to_json()
+        if p:
+            print("💾 تم التصدير إلى: %s" % p)
+        return
+
+    if args.train > 0:
+        total = 0
+        last = ""
+        for _ in range(args.train):
+            c, m = mem.train_patterns(db)
+            total += c
+            last = m
+        print("🎓 %s" % last)
+        print("   إجمالي التكرار: %d، إجمالي الأزواج: %d"
+              % (args.train, total))
+        return
+
+    if args.ask:
+        reply = dm.respond(args.ask)
+        print("أنت > %s" % args.ask)
+        print("MiniChat > %s" % _wrap_text(reply))
+        return
+
+    stdin_lines = []
+    if not sys.stdin.isatty():
+        try:
+            stdin_lines = [ln.strip() for ln in sys.stdin if ln.strip()]
+        except Exception:
+            stdin_lines = []
+
+    if stdin_lines:
+        print("=" * 60)
+        print("  MiniChat-AI v2.3 — وضع الأسئلة المتعددة")
+        print("=" * 60)
+        for raw_line in stdin_lines:
+            q = _clean_line(raw_line)
+            if not q:
+                continue
+            reply = dm.respond(q)
+            if reply == "__EXIT__":
+                print("\nMiniChat > إلى اللقاء!")
+                break
+            print("\nأنت > %s" % q)
+            print("MiniChat > %s" % _wrap_text(reply))
+        print("\n" + "=" * 60)
+        print("  انتهى ✅")
+        print("=" * 60)
+        return
+
+    if args.chat:
+        dm.chat_loop()
+        return
+
+    print("=" * 60)
+    print("  MiniChat-AI v2.3 — عرض تجريبي")
+    print("=" * 60)
+    demo = [
+        "مرحبا",
+        "من انت",
+        "ما هي عاصمة فرنسا",
+        "~مساعدة",
+    ]
+    for q in demo:
+        reply = dm.respond(q)
+        print("\nأنت > %s" % q)
+        print("MiniChat > %s" % _wrap_text(reply))
+    print("\n" + "=" * 60)
+    print("  انتهى ✅")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()

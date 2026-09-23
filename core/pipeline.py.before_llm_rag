@@ -1,0 +1,320 @@
+# -*- coding: utf-8 -*-
+"""
+MiniChat v3 — Pipeline
+
+خط تنفيذ مركزي.
+
+يدعم حاليًا:
+- Tools
+- Knowledge Providers
+
+ولا يزال:
+- Understanding خارج الـPipeline
+- Planning خارج الـPipeline
+- Reasoning غير مدمج
+- LLM غير مدمج
+- Verification غير مدمج
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Optional
+
+from core.types import (
+    KnowledgeResult,
+    Result,
+    Status,
+    TaskPlan,
+    ToolResult,
+)
+from core.policies import EvidencePolicy
+
+
+class Pipeline:
+    """
+    خط تنفيذ موحد.
+
+    المكونات تسجل بأسماء مستقرة، مثل:
+        math
+        general
+        memory
+        llm
+    """
+
+    def __init__(self) -> None:
+        self._components: Dict[str, Any] = {}
+        self.evidence_policy = EvidencePolicy()
+
+    def register(self, name: str, component: Any) -> None:
+        if not name:
+            raise ValueError("component name cannot be empty")
+
+        if component is None:
+            raise ValueError(f"component '{name}' cannot be None")
+
+        self._components[name] = component
+
+    def get(self, name: str) -> Optional[Any]:
+        return self._components.get(name)
+
+    def execute(
+        self,
+        query: str,
+        plan: TaskPlan,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Result:
+
+        if not isinstance(query, str) or not query.strip():
+            return Result(
+                status=Status.INVALID_INPUT,
+                message="query must be a non-empty string",
+            )
+
+        if not isinstance(plan, TaskPlan):
+            return Result(
+                status=Status.INVALID_INPUT,
+                message="plan must be a TaskPlan",
+            )
+
+        # ----------------------------------------------------
+        # Tool execution
+        # ----------------------------------------------------
+
+        if plan.tools:
+            tool_results = []
+
+            for tool_name in plan.tools:
+                tool = self.get(tool_name)
+
+                if tool is None:
+                    return Result(
+                        status=Status.UNAVAILABLE,
+                        message=f"tool '{tool_name}' is not registered",
+                        source=tool_name,
+                        metadata={
+                            "pipeline": "v3",
+                            "stage": "tool",
+                        },
+                    )
+
+                run = getattr(tool, "run", None)
+
+                if not callable(run):
+                    return Result(
+                        status=Status.ERROR,
+                        message=f"component '{tool_name}' has no callable run()",
+                        source=tool_name,
+                        metadata={
+                            "pipeline": "v3",
+                            "stage": "tool",
+                        },
+                    )
+
+                try:
+                    tool_result = run(query, context=context)
+                except Exception as exc:
+                    return Result(
+                        status=Status.ERROR,
+                        message=str(exc),
+                        source=tool_name,
+                        metadata={
+                            "pipeline": "v3",
+                            "stage": "tool",
+                            "exception": type(exc).__name__,
+                        },
+                    )
+
+                if not isinstance(tool_result, ToolResult):
+                    return Result(
+                        status=Status.ERROR,
+                        message=(
+                            f"tool '{tool_name}' returned "
+                            f"{type(tool_result).__name__}, "
+                            "expected ToolResult"
+                        ),
+                        source=tool_name,
+                        metadata={
+                            "pipeline": "v3",
+                            "stage": "tool",
+                        },
+                    )
+
+                tool_results.append(tool_result)
+
+                if not tool_result.success:
+                    return Result(
+                        status=Status.EMPTY,
+                        value=tool_result,
+                        message=tool_result.error,
+                        source=tool_name,
+                        metadata={
+                            "pipeline": "v3",
+                            "stage": "tool",
+                            "tool_success": False,
+                        },
+                    )
+
+            # في المرحلة الحالية نستخدم أول نتيجة ناجحة.
+            selected = tool_results[0]
+
+            return Result(
+                status=Status.SUCCESS,
+                value=selected,
+                source=selected.tool,
+                confidence=1.0,
+                metadata={
+                    "pipeline": "v3",
+                    "stage": "tool",
+                    "tool_success": True,
+                },
+            )
+
+        # ----------------------------------------------------
+        # Knowledge Provider execution
+        # ----------------------------------------------------
+
+        if plan.providers:
+            provider_results = []
+
+            for provider_name in plan.providers:
+                provider = self.get(provider_name)
+
+                if provider is None:
+                    return Result(
+                        status=Status.UNAVAILABLE,
+                        message=f"provider '{provider_name}' is not registered",
+                        source=provider_name,
+                        metadata={
+                            "pipeline": "v3",
+                            "stage": "knowledge",
+                        },
+                    )
+
+                search = getattr(provider, "search", None)
+
+                if not callable(search):
+                    return Result(
+                        status=Status.ERROR,
+                        message=(
+                            f"component '{provider_name}' has no "
+                            "callable search()"
+                        ),
+                        source=provider_name,
+                        metadata={
+                            "pipeline": "v3",
+                            "stage": "knowledge",
+                        },
+                    )
+
+                try:
+                    knowledge_result = search(
+                        query,
+                        context=context,
+                        limit=5,
+                    )
+                except Exception as exc:
+                    return Result(
+                        status=Status.ERROR,
+                        message=str(exc),
+                        source=provider_name,
+                        metadata={
+                            "pipeline": "v3",
+                            "stage": "knowledge",
+                            "exception": type(exc).__name__,
+                        },
+                    )
+
+                if not isinstance(knowledge_result, KnowledgeResult):
+                    return Result(
+                        status=Status.ERROR,
+                        message=(
+                            f"provider '{provider_name}' returned "
+                            f"{type(knowledge_result).__name__}, "
+                            "expected KnowledgeResult"
+                        ),
+                        source=provider_name,
+                        metadata={
+                            "pipeline": "v3",
+                            "stage": "knowledge",
+                        },
+                    )
+
+                provider_results.append(
+                    (provider_name, knowledge_result)
+                )
+
+            # نستخدم أول Provider حاليًا.
+            provider_name, selected = provider_results[0]
+
+            if not selected.found:
+                return Result(
+                    status=Status.EMPTY,
+                    value=selected,
+                    source=provider_name,
+                    metadata={
+                        "pipeline": "v3",
+                        "stage": "knowledge",
+                        "knowledge_found": False,
+                    },
+                )
+
+            top_score = None
+
+            if selected.evidence:
+                top_score = selected.evidence[0].score
+
+            direct_answer = self.evidence_policy.direct_answer(
+                selected.evidence
+            )
+
+            # إذا كان لدينا دليل واحد قوي، فهو جواب نهائي.
+            # لا حاجة لاستدعاء LLM أو أي طبقة توليد.
+            if direct_answer:
+                return Result(
+                    status=Status.SUCCESS,
+                    value=selected.evidence[0].content.strip(),
+                    source=provider_name,
+                    confidence=(
+                        selected.evidence[0].score
+                        if selected.evidence[0].score is not None
+                        else selected.evidence[0].reliability
+                    ),
+                    metadata={
+                        "pipeline": "v3",
+                        "stage": "knowledge",
+                        "knowledge_found": True,
+                        "evidence_count": len(selected.evidence),
+                        "top_score": top_score,
+                        "direct_answer": True,
+                        "terminal": True,
+                    },
+                )
+
+            return Result(
+                status=Status.SUCCESS,
+                value=selected,
+                source=provider_name,
+                metadata={
+                    "pipeline": "v3",
+                    "stage": "knowledge",
+                    "knowledge_found": True,
+                    "evidence_count": len(selected.evidence),
+                    "top_score": top_score,
+                    "direct_answer": direct_answer,
+                    "terminal": direct_answer,
+                },
+            )
+
+        # ----------------------------------------------------
+        # No executable component yet
+        # ----------------------------------------------------
+
+        return Result(
+            status=Status.EMPTY,
+            value=None,
+            metadata={
+                "pipeline": "v3",
+                "executed": False,
+                "reason": "no_executable_stage",
+            },
+        )
