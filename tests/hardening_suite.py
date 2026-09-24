@@ -789,11 +789,188 @@ if (
 else:
     fail("deterministic repeatability", f"r1={r1!r} r2={r2!r}")
 
+# ==================== SECTION 15: SEMANTIC REASONING ====================
+
+section("Semantic reasoning")
+
+from reasoning.model import Fact, SemanticRule
+from reasoning.logic import LogicReasoner
+
+
+# 15.1 Typed identity
+a = Fact("أحمد", "طالب")
+b = Fact("أحمد", "طالب")
+
+assert a == b
+assert a.key == b.key
+assert str(a) == "أحمد هو طالب"
+ok("typed fact identity")
+
+
+# 15.2 Negation identity
+positive = Fact("أحمد", "طالب")
+negative = Fact("أحمد", "طالب", negated=True)
+
+assert positive != negative
+assert positive.key != negative.key
+assert negative.negate() == positive
+ok("negation identity")
+
+
+# 15.3 Surface text preservation
+surface = Fact(
+    "أحمد",
+    "طالب",
+    source_text="أحمد هو طالب."
+)
+
+assert str(surface) == "أحمد هو طالب."
+assert surface == Fact("أحمد", "طالب")
+ok("surface representation isolation")
+
+
+# 15.4 Entity / predicate separation
+fact = Fact("سوريا", "دولة")
+
+assert fact.subject == "سوريا"
+assert fact.predicate == "دولة"
+assert fact.subject != fact.predicate
+ok("entity predicate separation")
+
+
+# 15.5 Legacy atomic compatibility
+legacy = LogicReasoner()
+legacy.add_fact("A")
+legacy.add_rule("A", "B")
+
+result = legacy.infer("B")
+
+assert result.status == "proven"
+assert result.conclusion == "B"
+ok("legacy atomic compatibility")
+
+
+# 15.6 Typed semantic modus ponens
+typed = LogicReasoner()
+typed.add_fact(Fact("ليلى", "طالبة"))
+typed.add_rule(
+    SemanticRule(
+        Fact("ليلى", "طالبة"),
+        Fact("ليلى", "مجتهدة"),
+    )
+)
+typed.add_rule(
+    SemanticRule(
+        Fact("ليلى", "مجتهدة"),
+        Fact("ليلى", "ناجحة"),
+    )
+)
+
+result = typed.infer(Fact("ليلى", "ناجحة"))
+
+assert result.status == "proven"
+assert result.conclusion == "ليلى هو ناجحة"
+ok("typed semantic modus ponens")
+
+
+# 15.7 Similar wording must not imply logical identity
+safe = LogicReasoner()
+safe.add_fact(Fact("ليلى", "طالبة"))
+safe.add_rule(
+    SemanticRule(
+        Fact("ليلى", "طالبة"),
+        Fact("ليلى", "مجتهدة"),
+    )
+)
+
+result = safe.infer(Fact("ليلى", "ناجحة"))
+
+assert result.status == "undetermined"
+ok("linguistic similarity is not logical identity")
+
+
+# 15.8 Deterministic semantic chain
+chain = LogicReasoner()
+chain.add_fact(Fact("سقراط", "إنسان"))
+
+for predicate_a, predicate_b in [
+    ("إنسان", "حي"),
+    ("حي", "يتنفس"),
+    ("يتنفس", "يحتاج_الأكسجين"),
+]:
+    chain.add_rule(
+        SemanticRule(
+            Fact("سقراط", predicate_a),
+            Fact("سقراط", predicate_b),
+        )
+    )
+
+r1 = chain.infer(Fact("سقراط", "يحتاج_الأكسجين"))
+r2 = chain.infer(Fact("سقراط", "يحتاج_الأكسجين"))
+
+assert r1.status == "proven"
+assert r2.status == "proven"
+assert r1.steps == r2.steps
+assert r1.premises == r2.premises
+ok("semantic deterministic chain")
+
+
+# 15.9 Semantic contradiction
+contradiction = LogicReasoner()
+contradiction.add_fact(Fact("الجو", "ممطر"))
+contradiction.add_fact(Fact("الجو", "ممطر", negated=True))
+
+result = contradiction.infer(Fact("الجو", "ممطر"))
+
+assert result.status == "contradiction"
+ok("semantic contradiction")
+
+
+# 15.10 Provenance remains semantic
+prov = LogicReasoner()
+prov.add_fact(Fact("نور", "طالبة"))
+prov.add_fact(Fact("نور", "مريضة"))
+
+prov.add_rule(
+    SemanticRule(
+        Fact("نور", "طالبة"),
+        Fact("نور", "مجتهدة"),
+    )
+)
+prov.add_rule(
+    SemanticRule(
+        Fact("نور", "مجتهدة"),
+        Fact("نور", "ناجحة"),
+    )
+)
+
+result = prov.infer(Fact("نور", "ناجحة"))
+
+assert result.status == "proven"
+assert result.premises == ["نور هو طالبة"]
+assert "نور هو مريضة" not in result.premises
+ok("semantic proof provenance isolation")
+
+
+# 15.11 Negated semantic proof
+neg = LogicReasoner()
+neg.add_fact(Fact("رامي", "حاضر", negated=True))
+
+result = neg.infer(Fact("رامي", "حاضر"))
+
+assert result.status == "disproven"
+assert result.conclusion == "¬رامي هو حاضر"
+ok("semantic negated proof")
+
+
+print("SEMANTIC HARDENING: PASS")
+
 # ------------------------------------------------------------
 # Final report
 # ------------------------------------------------------------
-
-section("FINAL HARDENING REPORT")
+print("\n" + "=" * 78)
+print("FINAL HARDENING REPORT")
+print("=" * 78)
 
 total = PASS + FAIL + WARN
 

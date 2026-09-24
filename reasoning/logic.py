@@ -67,15 +67,54 @@ class LogicReasoner:
 
     def add_rule(
         self,
-        premise: str | Fact,
-        conclusion: str | Fact,
+        premise: str | Fact | SemanticRule,
+        conclusion: str | Fact | None = None,
         source: Optional[str] = None,
     ) -> None:
+        """
+        Add a rule through either supported API:
+
+            add_rule("A", "B")
+            add_rule(Fact(...), Fact(...))
+            add_rule(SemanticRule(...))
+        """
+
+        if isinstance(premise, SemanticRule):
+            if conclusion is not None:
+                raise TypeError(
+                    "عند تمرير SemanticRule لا يجوز تمرير conclusion"
+                )
+
+            rule = premise
+
+            if source is not None:
+                rule = SemanticRule(
+                    rule.premise,
+                    rule.conclusion,
+                    source,
+                )
+
+            if not rule.premise.subject or not rule.conclusion.subject:
+                raise ValueError(
+                    "المقدمة والنتيجة يجب ألا تكونا فارغتين"
+                )
+
+            self.rules.append(rule)
+            return
+
+        if conclusion is None:
+            raise TypeError(
+                "add_rule يتطلب conclusion عند استخدام "
+                "صيغة premise/conclusion"
+            )
+
         p = _parse_fact(premise)
         c = _parse_fact(conclusion)
 
         if not p.subject or not c.subject:
-            raise ValueError("المقدمة والنتيجة يجب ألا تكونا فارغتين")
+            raise ValueError(
+                "المقدمة والنتيجة يجب ألا تكونا فارغتين"
+            )
 
         self.rules.append(SemanticRule(p, c, source))
 

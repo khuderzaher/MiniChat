@@ -172,6 +172,26 @@ class ReasoningResult:
 
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def status(self) -> str:
+        """
+        الحالة المنطقية الرسمية للنتيجة.
+
+        تُحفظ داخليًا ضمن metadata للحفاظ على التوافق
+        مع البنية القديمة، وتُعرض كواجهة مباشرة للمستهلكين.
+        """
+        return str(self.metadata.get("status", "unknown"))
+
+    @property
+    def proof_provenance(self) -> Any:
+        """مصدر/مقدمات البرهان كما سجلها محرك الاستدلال."""
+        return self.metadata.get("proof_provenance")
+
+    @property
+    def ok(self) -> bool:
+        """هل النتيجة إثبات منطقي ناجح؟"""
+        return self.status == "proven" and self.valid
+
 
 # ============================================================
 # VERIFICATION RESULT
