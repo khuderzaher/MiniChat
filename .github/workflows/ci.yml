@@ -55,3 +55,15 @@ jobs:
       - name: Run variable reasoning hardening
         run: |
           python tests/test_variable_reasoning.py
+
+      - name: Run proof graph hardening
+        run: |
+          python tests/test_proof_graph.py
+
+      - name: Run proof integration hardening
+        run: |
+          python tests/test_proof_integration.py
+
+      - name: Run verification layer hardening
+        run: |
+          python tests/test_verification.py

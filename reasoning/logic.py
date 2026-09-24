@@ -14,6 +14,7 @@ from reasoning.model import (
     VariableRule,
     clean_text,
 )
+from reasoning.proof import ProofGraph, explain_proof, proof_tree
 from reasoning.unification import (
     apply_bindings_to_predicate,
     find_all_bindings,
@@ -135,6 +136,16 @@ class LogicReasoner:
         self.variable_rules.append(rule)
 
     @staticmethod
+    def _rule_id_for(rule: SemanticRule, index: int) -> str:
+        """Stable deterministic identifier for a legacy/typed rule."""
+        return f"semantic:{index}:{rule.key}"
+
+    @staticmethod
+    def _variable_rule_id(rule: VariableRule, index: int) -> str:
+        """Stable deterministic identifier for a variable rule."""
+        return rule.rule_id or f"variable:{index}"
+
+    @staticmethod
     def negate(value: str | Fact) -> str:
         return str(_parse_fact(value).negate())
 
@@ -196,6 +207,8 @@ class LogicReasoner:
         self,
         known: set[Fact],
         provenance: dict[Fact, set[Fact]],
+        proof_graph: Optional[ProofGraph] = None,
+        rule_ids: Optional[dict[int, str]] = None,
     ) -> list[DerivedFact]:
 
         if not self.variable_rules:
@@ -231,7 +244,7 @@ class LogicReasoner:
                     bindings,
                 )
 
-                if fact is None or fact in known:
+                if fact is None:
                     continue
 
                 support = self._collect_variable_support(
@@ -239,6 +252,25 @@ class LogicReasoner:
                     bindings,
                     snapshot,
                 )
+
+                if proof_graph is not None:
+                    index = self.variable_rules.index(rule)
+                    rid = (
+                        rule_ids.get(index)
+                        if rule_ids is not None
+                        else self._variable_rule_id(rule, index)
+                    )
+                    proof_graph.add_inference(
+                        fact,
+                        rule_id=rid,
+                        bindings=dict(bindings),
+                        parents=support,
+                        source=rule.source or None,
+                    )
+
+                if fact in known:
+                    # Alternative proof path for an existing fact.
+                    continue
 
                 base_support = self._support_for(
                     support,
@@ -313,6 +345,87 @@ class LogicReasoner:
 
         return results
 
+    @staticmethod
+    def _proof_paths(
+        graph: ProofGraph,
+        fact: object,
+        max_paths: int = 10,
+    ) -> list[dict]:
+        """
+        All distinct proof paths for a fact in the graph.
+
+        A path is one inference node proving the fact plus its full
+        ancestor closure.  Results are sorted by node id so ordering
+        is deterministic regardless of insertion order.
+        """
+
+        paths: list[dict] = []
+
+        for node in graph.get_fact_nodes(fact):
+            if node.kind != "inference":
+                continue
+
+            ancestors = sorted(graph.ancestors(node.node_id))
+
+            paths.append(
+                {
+                    "node_id": node.node_id,
+                    "rule_id": node.rule_id,
+                    "bindings": dict(node.bindings),
+                    "parents": list(node.parents),
+                    "ancestors": ancestors,
+                }
+            )
+
+            if len(paths) >= max_paths:
+                break
+
+        return paths
+
+    @staticmethod
+    def _minimal_proofs(
+        graph: ProofGraph,
+        fact: object,
+        max_proofs: int = 5,
+    ) -> list[dict]:
+        """
+        Rank alternative proofs: prefer fewer steps and fewer base
+        facts; ties broken deterministically by node id.
+        """
+
+        candidates = LogicReasoner._proof_paths(
+            graph,
+            fact,
+            max_paths=50,
+        )
+
+        def size(node_id: str) -> int:
+            depth = 0
+            seen = {node_id}
+            frontier = [node_id]
+            while frontier:
+                current = frontier.pop()
+                node = graph.nodes.get(current)
+                if node is None:
+                    continue
+                for parent in node.parents:
+                    if parent not in seen:
+                        seen.add(parent)
+                        frontier.append(parent)
+                depth += 1
+            return len(seen)
+
+        ranked = sorted(
+            candidates,
+            key=lambda item: (
+                size(item["node_id"]),
+                len(item["ancestors"]),
+                item["node_id"],
+            ),
+        )
+
+        return ranked[:max_proofs]
+
     def infer(
         self,
         goal: Optional[str | Fact] = None,
@@ -327,6 +440,27 @@ class LogicReasoner:
 
         steps: list[str] = []
 
+        # ------------------------------------------------------------
+        # Proof graph integration: every derivation is recorded as a
+        # deterministic inference node over base-fact nodes, so the
+        # final result carries an explicit proof DAG (not just a
+        # flattened set of supporting facts).
+        # ------------------------------------------------------------
+        proof_graph = ProofGraph()
+
+        for fact in sorted(known, key=lambda item: item.key):
+            proof_graph.add_fact(fact)
+
+        semantic_rule_ids = {
+            index: self._rule_id_for(rule, index)
+            for index, rule in enumerate(self.rules)
+        }
+
+        variable_rule_ids = {
+            index: self._variable_rule_id(rule, index)
+            for index, rule in enumerate(self.variable_rules)
+        }
+
         for _depth in range(
             1,
             self.max_depth + 1,
@@ -335,12 +469,21 @@ class LogicReasoner:
             added = False
 
             # Legacy / typed direct rules.
-            for rule in self.rules:
+            for rule_index, rule in enumerate(self.rules):
 
                 if rule.premise not in known:
                     continue
 
                 if rule.conclusion in known:
+                    # Record the alternative proof path anyway so
+                    # multiple proofs remain visible in the graph.
+                    proof_graph.add_inference(
+                        rule.conclusion,
+                        rule_id=semantic_rule_ids[rule_index],
+                        bindings={},
+                        parents=[rule.premise],
+                        source=rule.source,
+                    )
                     continue
 
                 known.add(rule.conclusion)
@@ -350,6 +493,14 @@ class LogicReasoner:
                         rule.premise,
                         {rule.premise},
                     )
+                )
+
+                proof_graph.add_inference(
+                    rule.conclusion,
+                    rule_id=semantic_rule_ids[rule_index],
+                    bindings={},
+                    parents=[rule.premise],
+                    source=rule.source,
                 )
 
                 source = (
@@ -371,6 +522,8 @@ class LogicReasoner:
             variable_derived = self._derive_variable_once(
                 known,
                 provenance,
+                proof_graph=proof_graph,
+                rule_ids=variable_rule_ids,
             )
 
             if variable_derived:
@@ -424,6 +577,7 @@ class LogicReasoner:
                         if not self.variable_rules
                         else "hybrid_modus_ponens_unification"
                     ),
+                    "proof_graph": proof_graph.serialize(),
                     "derived_facts": sorted(
                         str(fact)
                         for fact in known - self.facts
@@ -459,6 +613,16 @@ class LogicReasoner:
                 {opposite},
             )
 
+            proof_graph.add_inference(
+                Fact(
+                    clean_goal.subject,
+                    "تناقض:" + clean_goal.predicate,
+                ),
+                rule_id="contradiction",
+                bindings={},
+                parents=[clean_goal, opposite],
+            )
+
             premises = sorted(
                 {
                     str(fact)
@@ -491,6 +655,13 @@ class LogicReasoner:
                             for fact in opposite_support
                         ),
                     },
+                    "proof_graph": proof_graph.serialize(),
+                    "goal_proofs": self._minimal_proofs(
+                        proof_graph, clean_goal
+                    ),
+                    "negation_proofs": self._minimal_proofs(
+                        proof_graph, opposite
+                    ),
                     "variable_rules": len(
                         self.variable_rules
                     ),
@@ -524,6 +695,47 @@ class LogicReasoner:
                     "goal": str(clean_goal),
                     "negation": str(opposite),
                     "proof_provenance": premises,
+                    "proof_graph": proof_graph.serialize(),
+                    "proof_paths": self._proof_paths(
+                        proof_graph, clean_goal
+                    ),
+                    "proof_tree": (
+                        proof_tree(
+                            proof_graph,
+                            self._proof_paths(
+                                proof_graph, clean_goal, max_paths=1
+                            )[0]["node_id"],
+                        )
+                        if self._proof_paths(
+                            proof_graph, clean_goal, max_paths=1
+                        )
+                        else None
+                    ),
+                    "proof_explanation": (
+                        explain_proof(
+                            proof_graph,
+                            self._proof_paths(
+                                proof_graph, clean_goal, max_paths=1
+                            )[0]["node_id"],
+                        )
+                        if self._proof_paths(
+                            proof_graph, clean_goal, max_paths=1
+                        )
+                        else []
+                    ),
+                    "selected_proof": (
+                        self._minimal_proofs(
+                            proof_graph, clean_goal, max_proofs=1
+                        )[0]
+                        if proof_graph.get_fact_nodes(clean_goal)
+                        and any(
+                            node.kind == "inference"
+                            for node in proof_graph.get_fact_nodes(
+                                clean_goal
+                            )
+                        )
+                        else None
+                    ),
                     "variable_rules": len(
                         self.variable_rules
                     ),
@@ -557,6 +769,10 @@ class LogicReasoner:
                     "goal": str(clean_goal),
                     "negation": str(opposite),
                     "proof_provenance": premises,
+                    "proof_graph": proof_graph.serialize(),
+                    "proof_paths": self._proof_paths(
+                        proof_graph, opposite
+                    ),
                     "variable_rules": len(
                         self.variable_rules
                     ),

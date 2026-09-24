@@ -20,6 +20,7 @@ from tools.math import MathTool
 from generation.llm import LocalQwenProvider
 from reasoning.engine import FormalReasoner
 from reasoning.storage import ReasoningStore
+from core.verification import DefaultVerifier
 
 
 class MiniChatRuntime:
@@ -54,6 +55,12 @@ class MiniChatRuntime:
             FormalReasoner(
                 store=ReasoningStore(),
             ),
+        )
+
+        # Verification (deterministic; never an LLM)
+        self.orchestrator.pipeline.register(
+            "verifier",
+            DefaultVerifier(),
         )
 
     def handle(

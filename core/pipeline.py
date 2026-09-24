@@ -161,7 +161,7 @@ class Pipeline:
             # في المرحلة الحالية نستخدم أول نتيجة ناجحة.
             selected = tool_results[0]
 
-            return Result(
+            tool_result_payload = Result(
                 status=Status.SUCCESS,
                 value=selected,
                 source=selected.tool,
@@ -172,6 +172,59 @@ class Pipeline:
                     "tool_success": True,
                 },
             )
+
+            # Verification hook: deterministic re-check when a
+            # verifier is registered and the plan requests it.
+            if plan.needs_verification:
+                verifier = self.get("verifier")
+
+                if verifier is not None:
+                    verify = getattr(verifier, "verify", None)
+
+                    if callable(verify):
+                        try:
+                            check = verify(
+                                str(selected.formatted or ""),
+                                evidence=None,
+                                context={
+                                    "stage": "tool",
+                                    "tool": selected.tool,
+                                    "query": query,
+                                    "value": selected.value,
+                                },
+                            )
+                        except Exception as exc:
+                            check = None
+                            tool_result_payload.metadata[
+                                "verification_error"
+                            ] = f"{type(exc).__name__}: {exc}"
+
+                        if check is not None:
+                            tool_result_payload.metadata[
+                                "verification"
+                            ] = {
+                                "verified": bool(
+                                    getattr(check, "metadata", {}).get(
+                                        "verified", False
+                                    )
+                                ),
+                                "issues": list(
+                                    getattr(check, "metadata", {}).get(
+                                        "issues", []
+                                    )
+                                ),
+                            }
+
+                            if not tool_result_payload.metadata[
+                                "verification"
+                            ]["verified"]:
+                                # لا نتجاهل فشل التحقق بصمت.
+                                tool_result_payload.status = Status.ERROR
+                                tool_result_payload.message = (
+                                    "tool result failed verification"
+                                )
+
+            return tool_result_payload
 
         # ----------------------------------------------------
         # Reasoning execution
@@ -221,17 +274,56 @@ class Pipeline:
                     },
                 )
 
+            reasoning_metadata = {
+                "pipeline": "v3",
+                "stage": "reasoning",
+                "reasoning_valid": reasoning_result.valid,
+                "reasoning_status": reasoning_result.metadata.get("status"),
+            }
+
+            proof_graph = reasoning_result.metadata.get("proof_graph")
+
+            if proof_graph is not None:
+                reasoning_metadata["proof_node_count"] = len(
+                    proof_graph.get("nodes", {})
+                )
+
+                verifier = self.get("verifier")
+
+                if verifier is not None:
+                    verify = getattr(verifier, "verify", None)
+
+                    if callable(verify):
+                        try:
+                            check = verify(
+                                str(reasoning_result.conclusion or ""),
+                                evidence=None,
+                                context={
+                                    "stage": "reasoning",
+                                    "proof_graph": proof_graph,
+                                },
+                            )
+                            reasoning_metadata["proof_verified"] = bool(
+                                getattr(check, "metadata", {}).get(
+                                    "verified", False
+                                )
+                            )
+                        except Exception as exc:
+                            reasoning_metadata["proof_verified"] = False
+                            reasoning_metadata["verification_error"] = (
+                                f"{type(exc).__name__}: {exc}"
+                            )
+
             return Result(
-                status=Status.SUCCESS if reasoning_result.valid else Status.EMPTY,
+                status=(
+                    Status.SUCCESS
+                    if reasoning_result.valid
+                    else Status.EMPTY
+                ),
                 value=reasoning_result,
                 source="reasoner",
                 confidence=reasoning_result.confidence,
-                metadata={
-                    "pipeline": "v3",
-                    "stage": "reasoning",
-                    "reasoning_valid": reasoning_result.valid,
-                    "reasoning_status": reasoning_result.metadata.get("status"),
-                },
+                metadata=reasoning_metadata,
             )
 
         # ----------------------------------------------------
