@@ -88,6 +88,45 @@ class MathTool(Tool):
         text = query.strip()
 
         # ------------------------------------------------
+        # 0) integer-predicate question (هل 17 عدد أولي؟)
+        #    argument extraction lives in MathCapability; here we
+        #    only execute what was extracted, deterministically.
+        # ------------------------------------------------
+
+        predicate_request = (context or {}).get("math_predicate")
+
+        if isinstance(predicate_request, dict):
+            name = predicate_request.get("predicate")
+            number = predicate_request.get("number")
+
+            try:
+                answer = MathEngine.integer_predicate(name, number)
+            except (TypeError, ValueError) as exc:
+                return ToolResult(
+                    success=False,
+                    tool=self.name,
+                    error=f"predicate_unavailable:{exc}",
+                )
+
+            verdict = "نعم" if answer else "لا"
+
+            return ToolResult(
+                success=True,
+                tool=self.name,
+                value=answer,
+                formatted=(
+                    f"{verdict}: {number} "
+                    f"{'محقق' if answer else 'غير محقق'} لخاصية {name}"
+                ),
+                metadata={
+                    "operation": "integer_predicate",
+                    "predicate": name,
+                    "number": number,
+                    "answer": answer,
+                },
+            )
+
+        # ------------------------------------------------
         # 1) استخراج التعبير الرياضي
         # ------------------------------------------------
 

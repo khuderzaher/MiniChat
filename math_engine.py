@@ -6,6 +6,55 @@ from datetime import datetime
 
 
 class MathEngine:
+    @staticmethod
+    def is_prime(n):
+        """Deterministic primality test for integers."""
+        if not isinstance(n, int):
+            raise TypeError("is_prime requires an integer")
+        if n < 2:
+            return False
+        if n % 2 == 0:
+            return n == 2
+        divisor = 3
+        while divisor * divisor <= n:
+            if n % divisor == 0:
+                return False
+            divisor += 2
+        return True
+
+    @staticmethod
+    def is_perfect_square(n):
+        if not isinstance(n, int) or n < 0:
+            return False
+        root = int(n ** 0.5)
+        for candidate in (root - 1, root, root + 1):
+            if candidate >= 0 and candidate * candidate == n:
+                return True
+        return False
+
+    _INTEGER_PREDICATES = {
+        "prime": lambda n: MathEngine.is_prime(n),
+        "perfect_square": lambda n: MathEngine.is_perfect_square(n),
+        "even": lambda n: n % 2 == 0,
+        "odd": lambda n: n % 2 != 0,
+    }
+
+    @classmethod
+    def integer_predicate(cls, name, n):
+        """
+        Execute a named integer predicate deterministically.
+
+        Raises ValueError for unknown predicates so callers can
+        distinguish "cannot solve" from "the answer is no".
+        """
+        function = cls._INTEGER_PREDICATES.get(name)
+        if function is None:
+            raise ValueError(f"unknown_integer_predicate:{name}")
+        if not isinstance(n, int):
+            raise TypeError("integer predicate requires an integer")
+        return bool(function(n))
+
+
     SAFE_CHARS = set("0123456789+-*/.()%^ ")
 
     @staticmethod

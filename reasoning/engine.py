@@ -172,6 +172,19 @@ class FormalReasoner(Reasoner):
             "goal"
         )
 
+        # A goal may also be a *pattern* (VariablePredicate), e.g. a
+        # relational query like أطول(?X, @كريم).  We ground it once
+        # the closure is computed via derive_with_variables below;
+        # for now LogicReasoner.infer only accepts Fact/str, so we
+        # keep pattern goals aside.
+        goal_pattern = None
+
+        from reasoning.model import VariablePredicate as _VP
+
+        if isinstance(goal, _VP):
+            goal_pattern = goal
+            goal = None
+
         engine = LogicReasoner(
             max_depth=self.max_depth
         )
@@ -300,6 +313,58 @@ class FormalReasoner(Reasoner):
         result = engine.infer(
             goal=goal
         )
+
+        if goal_pattern is not None:
+            # Backward-chaining over the derived closure: try every
+            # binding of the pattern against all known/derived facts.
+            from reasoning.unification import find_all_bindings
+            from reasoning.model import Fact as _F
+
+            closure_facts = sorted(
+                {
+                    _F.from_text(text)
+                    for text in result.metadata.get("derived_facts", [])
+                }
+                | set(engine.facts),
+                key=lambda fact: fact.key,
+            )
+
+            matches = find_all_bindings(
+                [goal_pattern.as_tuple()],
+                closure_facts,
+            )
+
+            if matches:
+                bindings = matches[0]
+                grounded = goal_pattern.grounded_predicate(bindings)
+                subject = grounded.args[0]
+                target = grounded.args[1].lstrip("@")
+                predicate_core = grounded.functor
+
+                conclusion_text = f"{subject} هو {predicate_core} @{target}"
+
+                premises = sorted(
+                    str(fact)
+                    for fact in closure_facts
+                    if fact.subject == subject or fact.subject == target
+                )
+
+                result.valid = True
+                result.conclusion = conclusion_text
+                result.premises = premises
+                result.confidence = 1.0
+                result.metadata.update(
+                    {
+                        "status": "proven",
+                        "method": "backward_pattern_match",
+                        "goal_bindings": dict(bindings),
+                    }
+                )
+            else:
+                result.valid = False
+                result.conclusion = None
+                result.confidence = 0.0
+                result.metadata["status"] = "not_proven"
 
         if evidence:
             result.evidence = list(evidence)

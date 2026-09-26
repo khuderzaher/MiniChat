@@ -84,10 +84,26 @@ class VariablePredicate:
         if not self.functor:
             raise ValueError("functor must not be empty")
 
-        if len(self.args) != 1:
+        if len(self.args) not in (1, 2):
             raise ValueError(
-                "MiniChat variable predicates currently support exactly one argument"
+                "MiniChat variable predicates support exactly one or two arguments"
             )
+
+        if any(not arg for arg in self.args):
+            raise ValueError("predicate arguments must not be empty")
+
+        # canonical arity-2 form: the second argument is a *relation
+        # target* term, either another variable ("?Y") or an explicit
+        # object marker ("@value").  Bare strings as second arguments
+        # are rejected so unification never depends on accidental
+        # surface similarity of arbitrary text.
+        if len(self.args) == 2:
+            target = self.args[1]
+            if not (target.startswith("?") or target.startswith("@")):
+                raise ValueError(
+                    "binary predicate target must be a variable (?X) "
+                    "or an explicit object term (@value)"
+                )
 
     def is_ground(self) -> bool:
         return not any(arg.startswith("?") for arg in self.args)
@@ -100,6 +116,31 @@ class VariablePredicate:
             arg for arg in self.args
             if isinstance(arg, str) and arg.startswith("?")
         }
+
+    def grounded_predicate(self, bindings: dict[str, str]) -> "VariablePredicate":
+        """
+        Substitute bound variables; keep unbound ones.
+
+        Used by solvers to turn a relational *goal* into a ground
+        pattern that can be matched against known facts.
+        """
+
+        resolved = []
+
+        for arg in self.args:
+            if arg.startswith("?") and arg in bindings:
+                value = bindings[arg]
+                resolved.append(
+                    value if value.startswith("@") else "@" + value
+                )
+            else:
+                resolved.append(arg)
+
+        return VariablePredicate(
+            functor=self.functor,
+            args=tuple(resolved),
+            negated=self.negated,
+        )
 
     def __str__(self) -> str:
         prefix = "¬" if self.negated else ""

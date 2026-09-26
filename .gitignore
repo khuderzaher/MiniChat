@@ -1,7 +1,3 @@
 # Python compiled files
 __pycache__/
 *.pyc
-
-# Database and local state files
-*.db
-minichat_db.json
