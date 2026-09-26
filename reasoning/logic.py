@@ -191,11 +191,15 @@ class LogicReasoner:
 
             for fact in facts:
 
+                if fact in seen:
+                    continue
+
+                # Exact grounding match — works for unary and
+                # canonical binary predicates alike.
                 if (
                     fact.subject == grounded.subject
                     and fact.predicate == grounded.predicate
                     and fact.negated == grounded.negated
-                    and fact not in seen
                 ):
                     support.append(fact)
                     seen.add(fact)
@@ -557,6 +561,11 @@ class LogicReasoner:
                 break
 
         if goal is None:
+            # No explicit goal was requested.  The derivation itself
+            # is still reported, but this result must never be read
+            # as "the question has been answered": conclusion stays
+            # None and the status below marks it undetermined so the
+            # pipeline cannot present it as SUCCESS.
             return ReasoningResult(
                 valid=True,
                 conclusion=None,
@@ -572,6 +581,7 @@ class LogicReasoner:
                 ),
                 metadata={
                     "engine": "logic",
+                    "status": "undetermined_no_goal",
                     "method": (
                         "typed_modus_ponens"
                         if not self.variable_rules

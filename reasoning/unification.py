@@ -35,6 +35,23 @@ def unify_term(
     return dict(bindings) if pattern == value else None
 
 
+def _fact_terms(fact: "Fact") -> list[str]:
+    """
+    Canonical term view of a Fact.
+
+    unary fact  -> [subject]
+    binary fact -> [subject, "@object"]
+
+    The "@" prefix marks the relation-target position explicitly so
+    it can never collide with a variable token.
+    """
+
+    if fact.predicate.startswith("@"):
+        return [fact.subject, fact.predicate]
+
+    return [fact.subject]
+
+
 def unify_with_fact(
     functor: str,
     args: list[str],
@@ -43,16 +60,28 @@ def unify_with_fact(
     bindings: Bindings,
 ) -> Optional[Bindings]:
 
-    if len(args) != 1:
+    terms = _fact_terms(fact)
+
+    if len(args) != len(terms):
         return None
 
-    if functor != fact.predicate:
+    if functor != fact.predicate.lstrip("@"):
         return None
 
     if negated != fact.negated:
         return None
 
-    return unify_term(args[0], fact.subject, bindings)
+    current = bindings
+
+    for pattern, value in zip(args, terms):
+        extended = unify_term(pattern, value, current)
+
+        if extended is None:
+            return None
+
+        current = extended
+
+    return current
 
 
 def find_all_bindings(
@@ -99,6 +128,12 @@ def find_all_bindings(
     return solutions
 
 
+def _resolve_term(token: str, bindings: Bindings) -> Optional[str]:
+    if is_variable(token):
+        return bindings.get(token)
+    return token
+
+
 def apply_bindings_to_predicate(
     functor: str,
     args: list[str],
@@ -108,20 +143,32 @@ def apply_bindings_to_predicate(
 
     from reasoning.model import Fact
 
-    if len(args) != 1:
-        return None
+    if len(args) == 1:
+        subject = _resolve_term(args[0], bindings)
 
-    value = args[0]
-
-    if is_variable(value):
-        if value not in bindings:
+        if subject is None:
             return None
-        subject = bindings[value]
-    else:
-        subject = value
 
-    return Fact(
-        subject=subject,
-        predicate=functor,
-        negated=negated,
-    )
+        return Fact(
+            subject=subject,
+            predicate=functor,
+            negated=negated,
+        )
+
+    if len(args) == 2:
+        subject = _resolve_term(args[0], bindings)
+        target = _resolve_term(args[1], bindings)
+
+        if subject is None or target is None:
+            return None
+
+        if not target.startswith("@"):
+            target = "@" + target
+
+        return Fact(
+            subject=subject,
+            predicate=f"{functor} {target}",
+            negated=negated,
+        )
+
+    return None

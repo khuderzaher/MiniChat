@@ -17,7 +17,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Optional
 
-from core.types import TaskPlan
+from core.types import CapabilityDecision, TaskPlan
+from core.capabilities import CapabilityAnalyzer
 
 
 class Planner:
@@ -29,6 +30,13 @@ class Planner:
     """
 
     name = "planner"
+
+    def __init__(self, analyzer: Optional[CapabilityAnalyzer] = None):
+        # The planner only *decides which capabilities are needed*.
+        # Whether a capability can actually solve the question is
+        # answered by the capability itself (can_solve), and final
+        # executability is re-checked at execution time.
+        self.analyzer = analyzer or CapabilityAnalyzer()
 
     @staticmethod
     def _looks_like_math(query: str) -> bool:
@@ -198,10 +206,72 @@ class Planner:
             plan.domain = "geography"
 
         # ----------------------------------------------------
-        # LLM
+        # Capability analysis (composable; replaces hard rules)
         # ----------------------------------------------------
 
-        plan.needs_llm = True
+        decisions = self.analyzer.analyze(query, understanding)
+
+        by_name = {
+            decision.capability: decision
+            for decision in decisions
+        }
+
+        plan.metadata["capability_decisions"] = [
+            {
+                "capability": decision.capability,
+                "can_solve": decision.can_solve,
+                "reason": decision.reason,
+            }
+            for decision in decisions
+        ]
+
+        math_decision = by_name.get("math")
+        reasoning_decision = by_name.get("reasoning")
+        knowledge_decision = by_name.get("knowledge")
+
+        # The planner records *needs* from its own routing policy
+        # (question_type/contexts above); the analyzer records what
+        # each solver can actually deliver.  Execution consumes the
+        # solver verdicts, never the needs flags alone.
+
+        deterministic_claimed = False
+
+        if math_decision is not None and math_decision.can_solve:
+            deterministic_claimed = True
+            plan.mode = "tool"
+            plan.tools.append("math")
+            plan.metadata["math_payload"] = dict(math_decision.payload)
+
+        if (
+            reasoning_decision is not None
+            and reasoning_decision.can_solve
+        ):
+            deterministic_claimed = True
+            plan.needs_reasoning = True
+            plan.metadata["reasoning_payload"] = {
+                "facts": list(reasoning_decision.payload.get("facts", [])),
+                "variable_rules": list(
+                    reasoning_decision.payload.get("variable_rules", [])
+                ),
+                "goal": reasoning_decision.payload.get("goal"),
+            }
+
+        if (
+            knowledge_decision is not None
+            and knowledge_decision.can_solve
+            and not deterministic_claimed
+        ):
+            plan.needs_knowledge = True
+            plan.providers.append("general")
+
+        # ----------------------------------------------------
+        # LLM — fallback ONLY when no deterministic capability
+        # claimed the question.  If a capability was selected but
+        # turns out unable at execution time, the pipeline reports
+        # that explicitly instead of silently escalating to LLM.
+        # ----------------------------------------------------
+
+        plan.needs_llm = not deterministic_claimed
 
         # ----------------------------------------------------
         # Verification

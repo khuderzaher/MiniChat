@@ -110,6 +110,34 @@ class Evidence:
 # ============================================================
 
 @dataclass
+@dataclass
+class CapabilityDecision:
+    """
+    قرار قدرة واحد من Planner.
+
+    capability:
+        اسم القدرة: math | reasoning | knowledge | llm
+
+    can_solve:
+        هل هذه القدرة قادرة فعليًا على حل السؤال؟
+
+    reason:
+        سبب صريح (رمز ثابت، ليس نصًا حرًا).
+
+    payload:
+        بيانات مخصصة للـSolver الذي سينفذ القرار
+        (مثل goal/facts/rules أو query المستخرج).
+    """
+
+    capability: str
+
+    can_solve: bool = False
+
+    reason: str = ""
+
+    payload: Dict[str, Any] = field(default_factory=dict)
+
+
 class TaskPlan:
     """
     خطة تنفيذ السؤال.

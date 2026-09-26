@@ -114,8 +114,25 @@ class Pipeline:
                         },
                     )
 
+                tool_context = dict(context or {})
+
+                if (
+                    tool_name == "math"
+                    and isinstance(
+                        getattr(plan, "metadata", None), dict
+                    )
+                    and "math_payload" in plan.metadata
+                ):
+                    payload = plan.metadata["math_payload"]
+
+                    if payload.get("kind") == "predicate":
+                        tool_context["math_predicate"] = {
+                            "predicate": payload.get("predicate"),
+                            "number": payload.get("number"),
+                        }
+
                 try:
-                    tool_result = run(query, context=context)
+                    tool_result = run(query, context=tool_context)
                 except Exception as exc:
                     return Result(
                         status=Status.ERROR,
@@ -173,56 +190,70 @@ class Pipeline:
                 },
             )
 
-            # Verification hook: deterministic re-check when a
-            # verifier is registered and the plan requests it.
-            if plan.needs_verification:
+            # Verification hook: deterministic re-check whenever a
+            # verifier is registered.  This is NOT gated on
+            # plan.needs_verification anymore: verification is
+            # fail-closed — if a verifier exists and refuses to
+            # certify the result, SUCCESS is impossible.
+            verifier = self.get("verifier")
+
+            if verifier is not None:
                 verifier = self.get("verifier")
 
-                if verifier is not None:
-                    verify = getattr(verifier, "verify", None)
+                verify = getattr(verifier, "verify", None)
 
-                    if callable(verify):
-                        try:
-                            check = verify(
-                                str(selected.formatted or ""),
-                                evidence=None,
-                                context={
-                                    "stage": "tool",
-                                    "tool": selected.tool,
-                                    "query": query,
-                                    "value": selected.value,
-                                },
-                            )
-                        except Exception as exc:
-                            check = None
-                            tool_result_payload.metadata[
-                                "verification_error"
-                            ] = f"{type(exc).__name__}: {exc}"
-
-                        if check is not None:
-                            tool_result_payload.metadata[
-                                "verification"
-                            ] = {
-                                "verified": bool(
-                                    getattr(check, "metadata", {}).get(
-                                        "verified", False
-                                    )
+                if callable(verify):
+                    try:
+                        check = verify(
+                            str(selected.formatted or ""),
+                            evidence=None,
+                            context={
+                                "stage": "tool",
+                                "tool": selected.tool,
+                                "query": query,
+                                "value": selected.value,
+                                "metadata": dict(
+                                    getattr(selected, "metadata", {}) or {}
                                 ),
-                                "issues": list(
-                                    getattr(check, "metadata", {}).get(
-                                        "issues", []
-                                    )
-                                ),
-                            }
+                            },
+                        )
+                    except Exception as exc:
+                        check = None
+                        tool_result_payload.metadata[
+                            "verification_error"
+                        ] = f"{type(exc).__name__}: {exc}"
 
-                            if not tool_result_payload.metadata[
-                                "verification"
-                            ]["verified"]:
-                                # لا نتجاهل فشل التحقق بصمت.
-                                tool_result_payload.status = Status.ERROR
-                                tool_result_payload.message = (
-                                    "tool result failed verification"
-                                )
+                    if check is None:
+                        verified_flag = False
+                        issues = ["verifier_returned_nothing"]
+                    else:
+                        check_meta = getattr(check, "metadata", {}) or {}
+                        verified_flag = bool(
+                            check_meta.get("verified", False)
+                        )
+                        issues = list(check_meta.get("issues", []))
+
+                    tool_result_payload.metadata["verification"] = {
+                        "verified": verified_flag,
+                        "issues": issues,
+                    }
+
+                    if not verified_flag:
+                        # لا نتجاهل فشل التحقق بصمت.
+                        tool_result_payload.status = Status.ERROR
+                        tool_result_payload.message = (
+                            "tool result failed verification"
+                        )
+            else:
+                # A tool result without any available verification
+                # cannot be certified; report it as unverified but
+                # keep the raw value for inspection.
+                tool_result_payload.metadata["verification"] = {
+                    "verified": False,
+                    "issues": ["no_verifier_registered"],
+                }
+                tool_result_payload.status = Status.EMPTY
+                tool_result_payload.message = "unverified_tool_result"
 
             return tool_result_payload
 
@@ -257,10 +288,30 @@ class Pipeline:
                     },
                 )
 
+            reasoning_context = dict(context or {})
+
+            payload = getattr(plan, "metadata", {}).get(
+                "reasoning_payload"
+            )
+
+            if isinstance(payload, dict):
+                # The planner forwards the compiled canonical form
+                # verbatim; the pipeline never interprets it.
+                reasoning_context.setdefault(
+                    "facts", list(payload.get("facts", []))
+                )
+                reasoning_context.setdefault(
+                    "variable_rules",
+                    list(payload.get("variable_rules", [])),
+                )
+                reasoning_context.setdefault(
+                    "goal", payload.get("goal")
+                )
+
             try:
                 reasoning_result = reason(
                     query,
-                    context=context,
+                    context=reasoning_context,
                 )
             except Exception as exc:
                 return Result(
@@ -281,47 +332,160 @@ class Pipeline:
                 "reasoning_status": reasoning_result.metadata.get("status"),
             }
 
+            for forwarded in ("method", "goal_bindings"):
+                if forwarded in reasoning_result.metadata:
+                    reasoning_metadata[forwarded] = (
+                        reasoning_result.metadata[forwarded]
+                    )
+
             proof_graph = reasoning_result.metadata.get("proof_graph")
+
+            # ------------------------------------------------------------
+            # Fail-closed contract:
+            #   SUCCESS requires ALL of:
+            #     * engine validity with an explicit conclusion
+            #     * a present, non-empty proof graph whose root
+            #       matches that conclusion
+            #     * verifier certification (well-formedness,
+            #       acyclicity, provenance coverage)
+            #   Anything else — missing/empty/cyclic/unverified
+            #   proof — must NOT become SUCCESS.
+            # ------------------------------------------------------------
+
+            conclusion = reasoning_result.conclusion
+
+            verification_issues: List[str] = []
+
+            if not reasoning_result.valid:
+                verification_issues.append("engine_reported_invalid")
+
+            if conclusion is None or not str(conclusion).strip():
+                verification_issues.append("missing_conclusion")
+
+            if proof_graph is None:
+                verification_issues.append("missing_proof_graph")
+            else:
+                nodes = proof_graph.get("nodes", {})
+
+                if not nodes:
+                    verification_issues.append("empty_proof_graph")
+
+                roots = [
+                    node
+                    for node in nodes.values()
+                    if node.get("kind") == "inference"
+                ]
+
+                if conclusion is not None and roots:
+                    if not any(
+                        node.get("fact") == str(conclusion)
+                        for node in roots
+                    ):
+                        verification_issues.append(
+                            "conclusion_not_root_of_proof"
+                        )
+
+            verifier = self.get("verifier")
+
+            verified = False
+
+            if verifier is None:
+                verification_issues.append("no_verifier_registered")
+            else:
+                verify = getattr(verifier, "verify", None)
+
+                if not callable(verify):
+                    verification_issues.append("verifier_lacks_verify")
+                else:
+                    try:
+                        check = verify(
+                            str(conclusion or ""),
+                            evidence=None,
+                            context={
+                                "stage": "reasoning",
+                                "query": query,
+                                "proof_graph": proof_graph,
+                                "conclusion": (
+                                    str(conclusion)
+                                    if conclusion is not None
+                                    else ""
+                                ),
+                                "premises": list(
+                                    reasoning_result.premises
+                                ),
+                                "provenance": (
+                                    reasoning_result.metadata.get(
+                                        "proof_provenance"
+                                    )
+                                ),
+                            },
+                        )
+                        check_meta = (
+                            getattr(check, "metadata", {}) or {}
+                        )
+                        verified = bool(check_meta.get("verified", False))
+                        verification_issues.extend(
+                            check_meta.get("issues", [])
+                        )
+                    except Exception as exc:
+                        verified = False
+                        verification_issues.append(
+                            f"verification_error:{type(exc).__name__}"
+                        )
+
+            if not verified:
+                verification_issues.append("not_certified_by_verifier")
+
+            reasoning_metadata["proof_verified"] = bool(
+                verified
+                and reasoning_result.valid
+                and conclusion is not None
+                and proof_graph is not None
+                and proof_graph.get("nodes", {})
+                and not verification_issues
+            )
+            reasoning_metadata["verification_issues"] = sorted(
+                set(verification_issues)
+            )
+
+            if reasoning_metadata["proof_verified"]:
+                return Result(
+                    status=Status.SUCCESS,
+                    value=conclusion,
+                    source="reasoner",
+                    confidence=(
+                        reasoning_result.confidence
+                        if reasoning_result.confidence is not None
+                        else 1.0
+                    ),
+                    metadata=reasoning_metadata,
+                )
 
             if proof_graph is not None:
                 reasoning_metadata["proof_node_count"] = len(
                     proof_graph.get("nodes", {})
                 )
 
-                verifier = self.get("verifier")
-
-                if verifier is not None:
-                    verify = getattr(verifier, "verify", None)
-
-                    if callable(verify):
-                        try:
-                            check = verify(
-                                str(reasoning_result.conclusion or ""),
-                                evidence=None,
-                                context={
-                                    "stage": "reasoning",
-                                    "proof_graph": proof_graph,
-                                },
-                            )
-                            reasoning_metadata["proof_verified"] = bool(
-                                getattr(check, "metadata", {}).get(
-                                    "verified", False
-                                )
-                            )
-                        except Exception as exc:
-                            reasoning_metadata["proof_verified"] = False
-                            reasoning_metadata["verification_error"] = (
-                                f"{type(exc).__name__}: {exc}"
-                            )
+            # Unproven goal vs failed verification: distinguish so
+            # callers can see WHY there is no success.
+            unproven_only = set(verification_issues) <= {
+                "missing_conclusion",
+                "engine_reported_invalid",
+            }
 
             return Result(
-                status=(
-                    Status.SUCCESS
-                    if reasoning_result.valid
-                    else Status.EMPTY
+                status=Status.EMPTY if unproven_only else Status.ERROR,
+                value=(
+                    conclusion
+                    if conclusion is not None
+                    else reasoning_result
                 ),
-                value=reasoning_result,
                 source="reasoner",
+                message=(
+                    "not_proven"
+                    if unproven_only
+                    else "reasoning_failed_verification"
+                ),
                 confidence=reasoning_result.confidence,
                 metadata=reasoning_metadata,
             )
