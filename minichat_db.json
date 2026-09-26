@@ -1,0 +1,58 @@
+{
+  "version": "2.3",
+  "language_priority": [
+    "ar",
+    "en"
+  ],
+  "safety": {
+    "profanity": [],
+    "harm_patterns": [],
+    "safe_reply": "أفضّل ألا أخوض في هذا الموضوع."
+  },
+  "commands": {
+    "help": [
+      "مساعدة",
+      "help"
+    ],
+    "stats": [
+      "احصائيات",
+      "stats"
+    ],
+    "reset": [
+      "تصفير",
+      "reset"
+    ],
+    "remember": [
+      "تذكر",
+      "remember",
+      "احفظ"
+    ],
+    "forget": [
+      "انس",
+      "forget",
+      "احذف"
+    ],
+    "name": [
+      "اسمي",
+      "my name is"
+    ],
+    "feedback": [
+      "+",
+      "-",
+      "جيد",
+      "سيء",
+      "good",
+      "bad"
+    ]
+  },
+  "intents": [],
+  "faq": [],
+  "topics": {},
+  "synonyms": {},
+  "fallbacks_ar": [
+    "لم أفهم، أعد صياغة سؤالك."
+  ],
+  "fallbacks_en": [
+    "I didn't get that. Could you rephrase?"
+  ]
+}

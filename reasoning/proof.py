@@ -248,3 +248,102 @@ class ProofGraph:
                 )
             },
         }
+
+
+def proof_tree(graph: "ProofGraph", node_id: str, _seen=None) -> dict:
+    """
+    Render a deterministic nested proof tree for one node.
+
+    Each level exposes:
+        goal fact -> rule -> bindings -> premises (recursively)
+
+    Cycle safety: nodes already on the current traversal path are
+    rendered once with ``"cyclic": true`` instead of recursing.
+    """
+
+    if _seen is None:
+        _seen = set()
+
+    node = graph.nodes.get(node_id)
+
+    if node is None:
+        return {"node_id": node_id, "missing": True}
+
+    if node_id in _seen:
+        return {
+            "node_id": node_id,
+            "fact": node.fact,
+            "kind": node.kind,
+            "cyclic": True,
+        }
+
+    path = _seen | {node_id}
+
+    children = [
+        proof_tree(graph, parent, path)
+        for parent in sorted(node.parents)
+    ]
+
+    tree = {
+        "node_id": node.node_id,
+        "fact": node.fact,
+        "kind": node.kind,
+    }
+
+    if node.rule_id is not None:
+        tree["rule_id"] = node.rule_id
+
+    if node.bindings:
+        tree["bindings"] = dict(node.bindings)
+
+    if node.source is not None:
+        tree["source"] = node.source
+
+    if children:
+        tree["premises"] = children
+
+    return tree
+
+
+def explain_proof(graph: "ProofGraph", node_id: str) -> list[str]:
+    """
+    Flatten a proof tree into ordered human-readable explanation
+    lines (deterministic).
+    """
+
+    lines: list[str] = []
+
+    def visit(current: str, depth: int, seen: set):
+        node = graph.nodes.get(current)
+
+        if node is None:
+            return
+
+        if current in seen:
+            return
+
+        path = seen | {current}
+        prefix = "  " * depth
+
+        if node.kind == "inference":
+            rule = node.rule_id or "?"
+            bindings = ", ".join(
+                f"{k}={v}" for k, v in sorted(node.bindings)
+            )
+            suffix = f" [{bindings}]" if bindings else ""
+            lines.append(
+                f"{prefix}⊢ {node.fact}   ({rule}){suffix}"
+            )
+        else:
+            label = {
+                "fact": "given",
+                "assumption": "assumption",
+                "contradiction": "contradiction",
+            }.get(node.kind, node.kind)
+            lines.append(f"{prefix}• {node.fact}   ({label})")
+
+        for parent in sorted(node.parents):
+            visit(parent, depth + 1, path)
+
+    visit(node_id, 0, set())
+    return lines
